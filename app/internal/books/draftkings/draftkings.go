@@ -93,8 +93,11 @@ func (b *bookImpl) Descriptor() book.Descriptor {
 func (b *bookImpl) Tuning() book.Tuning {
 	return book.Tuning{
 		ReconcileEvery: 30 * time.Second,
-		MinSnapshotGap: restGap,
-		MinPollGap:     restGap,
+		// A full structure+price refresh at least every 5 min, on top of
+		// the 30 s price reconcile (FD does it every 2 min, PM every 1).
+		ResnapshotEvery: 5 * time.Minute,
+		MinSnapshotGap:  restGap,
+		MinPollGap:      restGap,
 	}
 }
 

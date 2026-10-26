@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"betstampodds/internal/book"
@@ -57,6 +58,30 @@ type Config struct {
 type bookImpl struct {
 	cfg Config
 	hc  *http.Client
+	// live is game -> in play, from the most recent snapshot. The stream
+	// reads it on every update: its own seed is fixed at connect, and the
+	// stream only restarts when the token set changes, so a game that kicks
+	// off would otherwise keep streaming as pregame.
+	live atomic.Pointer[map[string]bool]
+}
+
+// publishLive swaps in the latest snapshot's in-play flags.
+func (b *bookImpl) publishLive(snap *book.Snapshot) {
+	m := make(map[string]bool, len(snap.Games))
+	for _, g := range snap.Games {
+		m[g.BookGameID] = g.Live
+	}
+	b.live.Store(&m)
+}
+
+// liveOf reports a game's latest in-play flag, if a snapshot has seen it.
+func (b *bookImpl) liveOf(gameRef string) (bool, bool) {
+	m := b.live.Load()
+	if m == nil {
+		return false, false
+	}
+	v, ok := (*m)[gameRef]
+	return v, ok
 }
 
 func New(cfg Config) (book.Book, error) {
@@ -87,6 +112,14 @@ func (b *bookImpl) Tuning() book.Tuning {
 }
 
 func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
+	snap, err := b.snapshot(ctx)
+	if err == nil {
+		b.publishLive(snap)
+	}
+	return snap, err
+}
+
+func (b *bookImpl) snapshot(ctx context.Context) (*book.Snapshot, error) {
 	asOf := time.Now()
 	if b.cfg.Path != "" {
 		raw, err := os.ReadFile(b.cfg.Path)

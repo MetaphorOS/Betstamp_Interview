@@ -48,9 +48,10 @@ func main() {
 		}
 	}
 	var clockOffset time.Duration
+	offsetKnown := false
 	if *ntp != "" {
 		if off, rtt, err := clocksync.Best(*ntp, 4, 2*time.Second); err == nil {
-			clockOffset = off
+			clockOffset, offsetKnown = off, true
 			fmt.Printf("== clock offset vs %s: %+.1fms (rtt %.1fms); book→us is corrected by it\n", *ntp,
 				float64(off.Microseconds())/1000, float64(rtt.Microseconds())/1000)
 		} else {
@@ -84,6 +85,7 @@ func main() {
 	defer stopBoard()
 
 	pr := newPrinter(!*quiet, clockOffset)
+	pr.offsetKnown = offsetKnown
 	st, deltas, unsub, err := bd.SubscribeWithState(ctx)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
@@ -134,16 +136,30 @@ func main() {
 	if err == nil {
 		pr.summary(final, sups, time.Since(started))
 	}
+	// The correction is only as good as its stability over the run.
+	if *ntp != "" && pr.offsetKnown {
+		if off, _, err := clocksync.Best(*ntp, 4, 2*time.Second); err == nil {
+			drift := off - clockOffset
+			fmt.Printf("clock offset at end: %+.1fms (drift %+.1fms over the run)\n",
+				float64(off.Microseconds())/1000, float64(drift.Microseconds())/1000)
+			if drift > 20*time.Millisecond || drift < -20*time.Millisecond {
+				fmt.Println("WARNING: the clock moved more than 20 ms during the run; book→us figures are only good to about that")
+			}
+		} else {
+			fmt.Printf("clock offset at end unavailable (%v); drift unknown\n", err)
+		}
+	}
 }
 
 type printer struct {
-	verbose bool
-	offset  time.Duration // server - local
-	mu      sync.Mutex
-	games   map[string]board.GameView
-	slots   map[string]map[string]board.Entry
-	deltas  map[string]int
-	health  map[string][]string
+	verbose     bool
+	offset      time.Duration // server - local
+	offsetKnown bool          // false: book→us is printed raw and labelled so
+	mu          sync.Mutex
+	games       map[string]board.GameView
+	slots       map[string]map[string]board.Entry
+	deltas      map[string]int
+	health      map[string][]string
 }
 
 func newPrinter(verbose bool, offset time.Duration) *printer {
@@ -280,13 +296,17 @@ func (p *printer) summary(st board.State, sups map[string]*supervisor.Supervisor
 			}
 		}
 		h := st.Health[d.Name]
-		l := st.Latency[d.Name]
+		l := st.Latency[d.Name].All
 		fmt.Printf("%-10s health=%s games=%d slots=%d in-play-slots=%d deltas=%d reconnects=%d resyncs=%d frames=%d updates=%d dropped=%d\n",
 			d.Name, h.State, len(games), slots, live, p.deltas[d.Name], h.Reconnects, h.Resyncs, h.Frames, h.Updates, st.Dropped[d.Name])
 		fmt.Printf("%-10s latency: process p50=%.0fus p95=%.0fus max=%.0fus (n=%d)", "", l.ProcessP50us, l.ProcessP95us, l.ProcessMaxus, l.Samples)
 		if l.BookSamples > 0 {
 			off := float64(p.offset.Microseconds()) / 1000
-			fmt.Printf("  book→us p50=%.1fms p95=%.1fms max=%.1fms (n=%d, clock-corrected)", l.BookP50ms+off, l.BookP95ms+off, l.BookMaxms+off, l.BookSamples)
+			label := "clock-corrected"
+			if !p.offsetKnown {
+				label = "RAW: clock offset unknown"
+			}
+			fmt.Printf("  book→us p50=%.1fms p95=%.1fms max=%.1fms (n=%d, %s)", l.BookP50ms+off, l.BookP95ms+off, l.BookMaxms+off, l.BookSamples, label)
 		} else {
 			fmt.Printf("  book→us n/a (feed has no publish timestamp)")
 		}

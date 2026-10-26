@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"runtime/debug"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -99,6 +100,9 @@ type Supervisor struct {
 	polls          int64
 	pollErrors     int64
 	lastPollErr    string
+	rtts           []time.Duration // recent ping round trips to the book
+	handshake      time.Duration   // last connect's app-level request -> reply
+	handshakeAt    time.Time
 	lastErr        string
 
 	lastBeat atomic.Int64 // unix nanos
@@ -245,6 +249,8 @@ func (s *Supervisor) snapshotAllowed() bool {
 	defer s.mu.Unlock()
 	return time.Since(s.lastSnapshotAt) >= s.cfg.MinSnapshotGap
 }
+
+func msOf(d time.Duration) float64 { return float64(d.Microseconds()) / 1000 }
 
 func errString(err error) string {
 	if err == nil {
@@ -398,6 +404,21 @@ func (e *emitter) Emit(ctx context.Context, u model.Update) error {
 }
 
 func (e *emitter) Connected() { e.once.Do(func() { close(e.connected) }) }
+
+func (e *emitter) Pong(rtt time.Duration) {
+	e.s.mu.Lock()
+	e.s.rtts = append(e.s.rtts, rtt)
+	if len(e.s.rtts) > 20 {
+		e.s.rtts = e.s.rtts[1:]
+	}
+	e.s.mu.Unlock()
+}
+
+func (e *emitter) Handshake(rtt time.Duration) {
+	e.s.mu.Lock()
+	e.s.handshake, e.s.handshakeAt = rtt, time.Now().UTC()
+	e.s.mu.Unlock()
+}
 
 func (e *emitter) Heartbeat() {
 	e.s.lastBeat.Store(time.Now().UnixNano())
@@ -589,6 +610,14 @@ func (s *Supervisor) evaluate(ctx context.Context) {
 	}
 	h.Polls, h.PollErrors, h.LastPollAt, h.LastPollError = s.polls, s.pollErrors, s.pollOKAt, s.lastPollErr
 	h.Snapshots, h.SnapshotErrors, h.LastSnapshotAt = s.snapshots, s.snapErrors, s.snapOKAt
+	h.HandshakeMs, h.HandshakeAt = msOf(s.handshake), s.handshakeAt
+	h.PingLastMs, h.PingP50Ms = 0, 0
+	if n := len(s.rtts); n > 0 {
+		sorted := slices.Clone(s.rtts)
+		slices.Sort(sorted)
+		h.PingLastMs = msOf(s.rtts[n-1])
+		h.PingP50Ms = msOf(sorted[n/2])
+	}
 	s.health = h
 	s.mu.Unlock()
 	_ = s.sink.SetHealth(ctx, s.name, h)

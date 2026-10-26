@@ -55,6 +55,10 @@ type WireHealth struct {
 	Snapshots      int64             `json:"snapshots"`
 	SnapshotErrors int64             `json:"snapshotErrors"`
 	LastSnapAt     int64             `json:"lastSnapshotAt,omitempty"`
+	PingLastMs     float64           `json:"pingMs,omitempty"`
+	PingP50Ms      float64           `json:"pingP50Ms,omitempty"`
+	HandshakeMs    float64           `json:"handshakeMs,omitempty"`
+	HandshakeAt    int64             `json:"handshakeAt,omitempty"`
 }
 
 func wireHealth(h *board.Health) *WireHealth {
@@ -65,29 +69,38 @@ func wireHealth(h *board.Health) *WireHealth {
 		ConnectedSince: ms(h.ConnectedSince), Reconnects: h.Reconnects, Resyncs: h.Resyncs, LastError: h.LastError,
 		Frames: h.Frames, Updates: h.Updates, LastBeatAt: ms(h.LastHeartbeatAt),
 		Polls: h.Polls, PollErrors: h.PollErrors, LastPollAt: ms(h.LastPollAt), LastPollError: h.LastPollError,
-		Snapshots: h.Snapshots, SnapshotErrors: h.SnapshotErrors, LastSnapAt: ms(h.LastSnapshotAt)}
+		Snapshots: h.Snapshots, SnapshotErrors: h.SnapshotErrors, LastSnapAt: ms(h.LastSnapshotAt),
+		PingLastMs: h.PingLastMs, PingP50Ms: h.PingP50Ms, HandshakeMs: h.HandshakeMs, HandshakeAt: ms(h.HandshakeAt)}
 }
 
 type WireDelta struct {
-	Seq        uint64          `json:"seq"`
-	Kind       board.DeltaKind `json:"k"`
-	GameID     string          `json:"g,omitempty"`
-	Identity   string          `json:"id,omitempty"`
-	Book       string          `json:"b,omitempty"`
-	Entry      *WireEntry      `json:"e,omitempty"`
-	Removed    bool            `json:"rm,omitempty"`
-	Best       *board.Best     `json:"best,omitempty"`
-	Health     *WireHealth     `json:"h,omitempty"`
-	Game       *WireGame       `json:"game,omitempty"`
-	Source     model.Source    `json:"src,omitempty"`
-	RecvAt     int64           `json:"recv,omitempty"`
-	BookTS     int64           `json:"bts,omitempty"`
-	AppliedAt  int64           `json:"applied"`
-	ServerTime int64           `json:"now"` // when the hub encoded it
+	Seq        uint64           `json:"seq"`
+	Kind       board.DeltaKind  `json:"k"`
+	GameID     string           `json:"g,omitempty"`
+	Identity   string           `json:"id,omitempty"`
+	Book       string           `json:"b,omitempty"`
+	Entry      *WireEntry       `json:"e,omitempty"`
+	Removed    bool             `json:"rm,omitempty"`
+	Best       *board.Best      `json:"best,omitempty"`
+	Health     *WireHealth      `json:"h,omitempty"`
+	Confirms   map[string]int64 `json:"c,omitempty"`
+	Game       *WireGame        `json:"game,omitempty"`
+	Source     model.Source     `json:"src,omitempty"`
+	RecvAt     int64            `json:"recv,omitempty"`
+	BookTS     int64            `json:"bts,omitempty"`
+	AppliedAt  int64            `json:"applied"`
+	ServerTime int64            `json:"now"` // when the hub encoded it
 }
 
 func wireDelta(d board.Delta) WireDelta {
-	return WireDelta{Seq: d.Seq, Kind: d.Kind, GameID: d.GameID, Identity: d.Identity, Book: d.Book,
+	var confirms map[string]int64
+	if len(d.Confirms) > 0 {
+		confirms = make(map[string]int64, len(d.Confirms))
+		for k, t := range d.Confirms {
+			confirms[k] = ms(t)
+		}
+	}
+	return WireDelta{Confirms: confirms, Seq: d.Seq, Kind: d.Kind, GameID: d.GameID, Identity: d.Identity, Book: d.Book,
 		Entry: wireEntry(d.Entry), Removed: d.Removed, Best: d.Best, Health: wireHealth(d.Health),
 		Game: wireGame(d.Game), Source: d.Source, RecvAt: ms(d.RecvAt), BookTS: ms(d.BookTS),
 		AppliedAt: ms(d.AppliedAt), ServerTime: time.Now().UnixMilli()}
@@ -127,7 +140,8 @@ type WireState struct {
 	Games      []WireGame                    `json:"games"`
 	Slots      []WireSlot                    `json:"slots"`
 	Health     map[string]*WireHealth        `json:"health"`
-	Latency    map[string]board.LatencyStats `json:"latency"`
+	Latency    map[string]board.LatencySplit `json:"latency"`
+	Clock      Clock                         `json:"clock"` // server clock vs NTP
 }
 
 func wireState(st board.State) WireState {

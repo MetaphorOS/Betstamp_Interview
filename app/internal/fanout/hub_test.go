@@ -218,3 +218,18 @@ func TestPingCarriesServerTime(t *testing.T) {
 		t.Fatalf("ping %q", ev.data)
 	}
 }
+
+func TestClockValidity(t *testing.T) {
+	h := New(nil, Config{})
+	now := time.Now()
+	if c := h.clockAt(now); c.Valid || c.MeasuredAt != 0 {
+		t.Fatalf("never measured must be invalid, not zero-and-valid: %+v", c)
+	}
+	h.SetClock(-386*time.Millisecond, 24*time.Millisecond, now)
+	if c := h.clockAt(now.Add(time.Minute)); !c.Valid || c.OffsetMs != -386 || c.ErrMs != 12 {
+		t.Fatalf("fresh reading %+v", c)
+	}
+	if c := h.clockAt(now.Add(ClockMaxAge + time.Second)); c.Valid {
+		t.Fatalf("stale reading still valid: %+v", c)
+	}
+}

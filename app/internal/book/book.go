@@ -51,6 +51,12 @@ type Emitter interface {
 	Connected()
 	// Heartbeat reports any sign of life: a frame, a keep-alive, a pong.
 	Heartbeat()
+	// Pong reports the round trip of one ping to the book's server.
+	Pong(rtt time.Duration)
+	// Handshake reports the app-level request -> reply time at connect
+	// (DK subscribe -> subscribed, FD connection_init -> connection_ack,
+	// PM PING -> PONG once subscribed). Same idea for every book.
+	Handshake(rtt time.Duration)
 }
 
 // Book is implemented by each sportsbook package. A book package fetches,

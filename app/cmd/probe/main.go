@@ -75,6 +75,9 @@ func (e *emitter) Connected() {
 	}
 	e.mu.Unlock()
 }
+func (e *emitter) Pong(time.Duration)      {}
+func (e *emitter) Handshake(time.Duration) {}
+
 func (e *emitter) Heartbeat() {
 	e.mu.Lock()
 	e.beats++

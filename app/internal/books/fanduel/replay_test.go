@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -171,6 +172,9 @@ func TestCapturedBundleParses(t *testing.T) {
 	if b.SnapshotQuery == "" {
 		t.Fatal("snapshot query missing")
 	}
+	if b.AppKey != DefaultAK {
+		t.Fatalf("app key from the captured bundle = %q, want %q", b.AppKey, DefaultAK)
+	}
 }
 
 func TestUnknownRunnerResyncs(t *testing.T) {
@@ -242,6 +246,9 @@ func TestNBABoardFiltersCompetition(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Logf("nba games=%d quotes=%d skipped=%v", len(snap.Games), len(snap.Quotes), snap.Skipped)
+	if snap.Skipped["other_competition"] != 30 {
+		t.Fatalf("eBasketball markets not refused as other_competition: %v", snap.Skipped)
+	}
 	// The research filter (competition 10547864) gave 7 events / 42 selections;
 	// the other basketball competition on the board must not leak in.
 	if len(snap.Games) != 7 || len(snap.Quotes) != 42 {
@@ -250,6 +257,134 @@ func TestNBABoardFiltersCompetition(t *testing.T) {
 	for _, g := range snap.Games {
 		if g.Sport != "nba" || !strings.HasPrefix(g.Home.ID, "nba-") {
 			t.Fatalf("bad game %+v", g)
+		}
+	}
+}
+
+func TestAppKeyAnchorsOnEnumNotVariableName(t *testing.T) {
+	for _, src := range []string{
+		`r.SB_STUBS_REMOTE="SB_STUBS_REMOTE";let g="FhMFpcPWXMeyZxOx",h="645b09da6f"`,
+		`r.SB_STUBS_REMOTE="SB_STUBS_REMOTE";let $q="Zz9Yy8Xx7Ww6Vv5U",h="645b09da6f"`,
+		`r.SB_STUBS_REMOTE="SB_STUBS_REMOTE";var k="Zz9Yy8Xx7Ww6Vv5U"`, // looser fallback
+	} {
+		b := &Bundle{}
+		parseBundle(b, src)
+		if len(b.AppKey) != 16 {
+			t.Fatalf("no key from %q", src)
+		}
+	}
+}
+
+// fakeFD serves the frontend page and bundle, the discovery boards (which
+// 404 unless _ak is the current key, as FanDuel does), and SMP.
+type fakeFD struct {
+	key     string
+	smpKeys []string
+	mu      sync.Mutex
+}
+
+func (f *fakeFD) handler(t *testing.T) http.Handler {
+	board, err := os.ReadFile(testdata("soak-fd-bootstrap-1.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	smp, err := os.ReadFile(testdata("soak-fd-smp.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`<html><script src="/static/js/main.abc123.js"></script></html>`))
+	})
+	mux.HandleFunc("/static/js/main.abc123.js", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		key := f.key
+		f.mu.Unlock()
+		fmt.Fprintf(w, `x={aws_appsync_clientId:"cid-1"};r.SB_STUBS_REMOTE="SB_STUBS_REMOTE";let g="%s",h="1";q=`+"`"+`subscription OnUpdateMarketPrice($ids: [String!]!) {
+        onUpdateMarketPrice(ids: $ids) { id }
+    }`+"`", key)
+	})
+	mux.HandleFunc("/board", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		key := f.key
+		f.mu.Unlock()
+		if r.URL.Query().Get("_ak") != key {
+			w.WriteHeader(http.StatusNotFound)
+			w.Write([]byte(`{"error":true}`))
+			return
+		}
+		w.Write(board)
+	})
+	mux.HandleFunc("/smp", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.smpKeys = append(f.smpKeys, r.Header.Get("X-Application"))
+		f.mu.Unlock()
+		w.Write(smp)
+	})
+	return mux
+}
+
+func TestRotatedAppKeyRecoversWithoutAHuman(t *testing.T) {
+	f := &fakeFD{key: "OldKey1234567890"}
+	srv := httptest.NewServer(f.handler(t))
+	defer srv.Close()
+	b, _ := New(Config{
+		Leagues: []League{{Sport: "nfl", PageID: "nfl", EventTypeID: "6423"}},
+		PageURL: srv.URL + "/board?customPageId=", InPlayURL: "-",
+		SMPURL: srv.URL + "/smp", HomeURL: srv.URL + "/", BundlePath: "-",
+	})
+	ctx := context.Background()
+	if _, err := b.Snapshot(ctx); err != nil {
+		t.Fatalf("first snapshot: %v", err)
+	}
+	// FanDuel deploys: new bundle, new key; the old key now gets 404.
+	f.mu.Lock()
+	f.key = "NewKey0987654321"
+	f.mu.Unlock()
+	if _, err := b.Snapshot(ctx); err == nil {
+		t.Fatal("old key should be rejected once")
+	}
+	snap, err := b.Snapshot(ctx) // the supervisor retries; the bundle is re-read
+	if err != nil {
+		t.Fatalf("snapshot after rotation: %v", err)
+	}
+	if len(snap.Quotes) == 0 {
+		t.Fatal("no quotes after recovery")
+	}
+	f.mu.Lock()
+	last := f.smpKeys[len(f.smpKeys)-1]
+	f.mu.Unlock()
+	if last != "NewKey0987654321" {
+		t.Fatalf("SMP used key %q after rotation", last)
+	}
+}
+
+// FanDuel's live board carried "Philadelphia Eagles (OFFICER) @ Detroit Lions
+// (MEMENTO)" in "eFootball H2H GG League 4x4mins": an esports match under the
+// American-football type with real team names. It must never become a game.
+func TestEsportsWithNFLTeamNamesRefused(t *testing.T) {
+	raw, err := os.ReadFile(testdata("fd-inplay-efootball.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ParseLeagueBoards(time.Now(), DefaultLeagues, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(snap.Games) != 0 || len(snap.Quotes) != 0 {
+		t.Fatalf("esports leaked in: %d games %+v", len(snap.Games), snap.Games)
+	}
+	if snap.Skipped["other_competition"] == 0 {
+		t.Fatalf("skipped %v", snap.Skipped)
+	}
+	// The same event in the real NFL competition is accepted, by ID or by name.
+	for _, e := range []fdEvent{
+		{EventTypeID: "6423", CompetitionID: "12282733"},
+		{EventTypeID: "6423", CompetitionID: "99999999"},
+	} {
+		names := map[string]string{"99999999": "NFL"}
+		if sport, reason := sportOf(DefaultLeagues, e, names); sport != "nfl" || reason != "" {
+			t.Fatalf("real NFL refused: %v %q", e, reason)
 		}
 	}
 }

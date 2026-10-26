@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -19,7 +20,7 @@ import (
 )
 
 const (
-	pingEvery    = 30 * time.Second
+	pingEvery    = 15 * time.Second
 	ackTimeout   = 15 * time.Second
 	subscriberID = "board-prices"
 )
@@ -83,8 +84,23 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 	}()
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
-	conn.SetPongHandler(func(string) error { em.Heartbeat(); return nil })
+	// Pings are timed: the pong's round trip is the socket's network latency.
+	var pingSent atomic.Int64
+	conn.SetPongHandler(func(string) error {
+		em.Heartbeat()
+		if sent := pingSent.Swap(0); sent != 0 {
+			em.Pong(time.Since(time.Unix(0, sent)))
+		}
+		return nil
+	})
+	sendPing := func() error {
+		return write(func() error {
+			pingSent.Store(time.Now().UnixNano())
+			return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+		})
+	}
 
+	initSent := time.Now()
 	if err := sendJSON(map[string]any{"type": "connection_init"}); err != nil {
 		return fmt.Errorf("fanduel: connection_init: %w", err)
 	}
@@ -125,9 +141,7 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 				return errors.New("fanduel: no connection_ack/start_ack in time")
 			}
 		case <-ping.C:
-			if err := write(func() error {
-				return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
-			}); err != nil {
+			if err := sendPing(); err != nil {
 				return fmt.Errorf("fanduel: ping: %w", err)
 			}
 		case f, ok := <-frames:
@@ -147,6 +161,7 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 			}
 			switch res.kind {
 			case frameConnAck:
+				em.Handshake(f.recvAt.Sub(initSent))
 				msg, err := startMessage(auth, bundle.SubscriptionQuery, st.ids)
 				if err != nil {
 					return err
@@ -157,6 +172,9 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 			case frameStartAck:
 				started = true
 				em.Connected()
+				if err := sendPing(); err != nil {
+					return fmt.Errorf("fanduel: ping: %w", err)
+				}
 			case frameError:
 				b.bundles.invalidate()
 				return fmt.Errorf("%w: fanduel appsync error: %s", book.ErrAuth, truncate(res.errMsg, 300))

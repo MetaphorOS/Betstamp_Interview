@@ -177,3 +177,8 @@ td.team small { display: block; font-weight: 400; color: var(--muted); font-size
 /* price not confirmed for 5+ minutes */
 .cell .old-icon { display: none; position: absolute; top: 3px; right: 5px; font-size: 11px; line-height: 1; color: var(--warn); cursor: help; }
 .cell.old .old-icon { display: block; }
+
+/* latency sub-rows */
+.hrow.sub > span:first-child { padding-left: 12px; font-size: 11px; }
+.hrow.sub { padding-top: 0; }
+.muted { color: var(--muted); }

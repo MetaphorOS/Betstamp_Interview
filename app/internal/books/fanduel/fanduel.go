@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -29,7 +30,7 @@ const (
 	// DefaultAK is FanDuel's public frontend application key (not a
 	// credential). It can rotate; FD_AK overrides it.
 	DefaultAK        = "FhMFpcPWXMeyZxOx"
-	PageURL          = "https://sbapi.on.sportsbook.fanduel.ca/api/content-managed-page?page=CUSTOM&includePrices=true&_ak=" + DefaultAK + "&customPageId="
+	DefaultPageURL   = "https://sbapi.on.sportsbook.fanduel.ca/api/content-managed-page?page=CUSTOM&includePrices=true&_ak=" + DefaultAK + "&customPageId="
 	DefaultInPlayURL = "https://sbapi.on.sportsbook.fanduel.ca/api/in-play?_ak=" + DefaultAK + "&includeTabs=true"
 	DefaultSMPURL    = "https://smp.on.sportsbook.fanduel.ca/api/sports/fixedodds/readonly/v1/getMarketPrices?priceHistory=0"
 	DefaultWSURL     = "wss://pir.on.sportsbook.fanduel.ca/graphql/realtime"
@@ -44,39 +45,50 @@ const (
 // League is one FD league: its discovery page and how to recognise its
 // events on the multi-sport in-play board.
 type League struct {
-	Sport         string
-	PageID        string // content-managed-page customPageId
-	EventTypeID   string // FD sport id
-	CompetitionID string // required when set: basketball type 7522 also covers simulated games
+	Sport       string
+	PageID      string // content-managed-page customPageId
+	EventTypeID string // FD sport id
+	// The sport type alone is not enough: FanDuel files esports under the
+	// same types (eFootball H2H GG League under 6423, eBasketball under
+	// 7522), with real team names in the event name. An event must be in the
+	// league's competition: by ID, or by the competition's attached name.
+	CompetitionID   string
+	CompetitionName string
 }
 
 // DefaultLeagues: NFL and NBA.
 var DefaultLeagues = []League{
-	{Sport: "nfl", PageID: "nfl", EventTypeID: "6423"},
-	{Sport: "nba", PageID: "nba", EventTypeID: "7522", CompetitionID: "10547864"},
+	{Sport: "nfl", PageID: "nfl", EventTypeID: "6423", CompetitionID: "12282733", CompetitionName: "NFL"},
+	{Sport: "nba", PageID: "nba", EventTypeID: "7522", CompetitionID: "10547864", CompetitionName: "NBA"},
 }
 
 // sportOf classifies an event. Events without type info (trimmed fixtures)
 // belong to the first league.
-func sportOf(leagues []League, e fdEvent) (string, bool) {
+// sportOf classifies an event; reason says why it was refused. Events
+// without type info (trimmed fixtures) belong to the first league.
+func sportOf(leagues []League, e fdEvent, compNames map[string]string) (sport, reason string) {
 	if e.EventTypeID == "" {
-		return leagues[0].Sport, true
+		return leagues[0].Sport, ""
 	}
+	reason = "other_sport"
 	for _, l := range leagues {
 		if e.EventTypeID.String() != l.EventTypeID {
 			continue
 		}
-		if l.CompetitionID != "" && e.CompetitionID != "" && e.CompetitionID.String() != l.CompetitionID {
-			continue
+		cid := e.CompetitionID.String()
+		if cid == "" || (l.CompetitionID == "" && l.CompetitionName == "") ||
+			cid == l.CompetitionID || (l.CompetitionName != "" && compNames[cid] == l.CompetitionName) {
+			return l.Sport, ""
 		}
-		return l.Sport, true
+		reason = "other_competition" // right sport, wrong competition: esports, futures, specials
 	}
-	return "", false
+	return "", reason
 }
 
 // Config is owned by this package.
 type Config struct {
 	Leagues    []League
+	PageURL    string // discovery board URL prefix; the league's customPageId is appended
 	InPlayURL  string // live board, merged into discovery; "-" disables
 	Path       string // read one board from a file instead of the network (tests)
 	SMPURL     string
@@ -103,6 +115,9 @@ func New(cfg Config) (book.Book, error) {
 	}
 	if cfg.InPlayURL == "" && cfg.Path == "" {
 		cfg.InPlayURL = DefaultInPlayURL
+	}
+	if cfg.PageURL == "" {
+		cfg.PageURL = DefaultPageURL
 	}
 	if cfg.SMPURL == "" {
 		cfg.SMPURL = DefaultSMPURL
@@ -144,11 +159,24 @@ func (b *bookImpl) Tuning() book.Tuning {
 	}
 }
 
+// ak is the app key for the REST boards and SMP. An explicit key (Config or
+// FD_AK) wins; otherwise the one in FanDuel's current JS bundle, so a
+// rotation is picked up without a human; the built-in key is the last resort.
 func (b *bookImpl) ak() string {
 	if b.cfg.APIKey != "" {
 		return b.cfg.APIKey
 	}
+	if k := b.bundles.appKey(); k != "" {
+		return k
+	}
 	return DefaultAK
+}
+
+// keyRejected: a discovery board answers a wrong app key with 404
+// {"error":true} (SMP accepts any key, so the boards are the signal).
+func keyRejected(err error) bool {
+	var he *HTTPError
+	return errors.As(err, &he) && (he.Status == http.StatusNotFound || he.Status == http.StatusUnauthorized || he.Status == http.StatusForbidden)
 }
 
 // Snapshot reads every league's discovery board and merges the live board, so games
@@ -168,10 +196,18 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 		}
 		return buildSnapshot(asOf, b.cfg.Leagues, board)
 	}
+	// Best effort: load the bundle first so its app key is used. Failure is
+	// not fatal here; the stream reports it, and ak() falls back.
+	_, _ = b.bundles.get(ctx)
 	var boards []fdBoard
 	for _, l := range b.cfg.Leagues {
-		board, err := b.getBoard(ctx, withAK(PageURL+l.PageID, b.ak()))
+		board, err := b.getBoard(ctx, withAK(b.cfg.PageURL+l.PageID, b.ak()))
 		if err != nil {
+			if keyRejected(err) {
+				// Likely a rotated app key: re-read the bundle before the next try.
+				slog.Warn("fanduel board rejected the app key; refreshing the bundle", "key", prefix(b.ak()), "error", err)
+				b.bundles.invalidate()
+			}
 			// All leagues or none: a missing board would look like ended games.
 			return nil, fmt.Errorf("fanduel: %s board: %w", l.Sport, err)
 		}
@@ -180,6 +216,9 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 	if b.cfg.InPlayURL != "" && b.cfg.InPlayURL != "-" {
 		live, err := b.getBoard(ctx, withAK(b.cfg.InPlayURL, b.ak()))
 		if err != nil {
+			if keyRejected(err) {
+				b.bundles.invalidate()
+			}
 			// Without the live board, live games would look removed.
 			return nil, fmt.Errorf("fanduel: in-play board: %w", err)
 		}
@@ -326,7 +365,14 @@ func buildSnapshot(asOf time.Time, leagues []League, boards ...fdBoard) (*book.S
 	skipped := map[string]int{}
 	rawEvents := map[string]fdEvent{}
 	rawMarkets := map[string]fdMarket{}
+	compNames := map[string]string{}
 	for _, b := range boards {
+		for id, c := range b.Attachments.Competitions {
+			if c.CompetitionID != "" {
+				id = c.CompetitionID.String()
+			}
+			compNames[id] = c.Name
+		}
 		for _, e := range b.Attachments.Events {
 			rawEvents[e.EventID.String()] = e
 		}
@@ -361,9 +407,9 @@ func buildSnapshot(asOf time.Time, leagues []League, boards ...fdBoard) (*book.S
 			skipped["unknown_event"]++
 			continue
 		}
-		sport, ok := sportOf(leagues, e)
-		if !ok {
-			skipped["other_sport"]++
+		sport, reason := sportOf(leagues, e, compNames)
+		if reason != "" {
+			skipped[reason]++
 			continue
 		}
 		ev, ok := resolved[m.EventID.String()]
@@ -576,8 +622,12 @@ func (id ID) String() string { return string(id) }
 
 type fdBoard struct {
 	Attachments struct {
-		Events  map[string]fdEvent  `json:"events"`
-		Markets map[string]fdMarket `json:"markets"`
+		Events       map[string]fdEvent  `json:"events"`
+		Markets      map[string]fdMarket `json:"markets"`
+		Competitions map[string]struct {
+			CompetitionID ID     `json:"competitionId"`
+			Name          string `json:"name"`
+		} `json:"competitions"`
 	} `json:"attachments"`
 }
 type fdEvent struct {

@@ -80,7 +80,7 @@ func TestStreamMessages(t *testing.T) {
 	var got []model.Update
 	for _, f := range frames {
 		raw, _ := json.Marshal(f)
-		ups, err := sd.apply(raw, time.Now())
+		ups, err := sd.apply(raw, time.Now(), nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -93,7 +93,7 @@ func TestStreamMessages(t *testing.T) {
 	if got[0].American != -133 || got[1].American != -163 || !got[0].BookTS.IsZero() || got[1].BookTS.IsZero() {
 		t.Fatalf("prices %+v", got)
 	}
-	if ups, err := sd.apply([]byte("PONG"), time.Now()); err != nil || ups != nil {
+	if ups, err := sd.apply([]byte("PONG"), time.Now(), nil); err != nil || ups != nil {
 		t.Fatal("PONG must be ignored")
 	}
 }
@@ -126,5 +126,28 @@ func TestNBASeries(t *testing.T) {
 		if g.Sport != "nba" || !strings.HasPrefix(g.Home.ID, "nba-") || !strings.HasPrefix(g.Away.ID, "nba-") {
 			t.Fatalf("bad game %+v", g)
 		}
+	}
+}
+
+func TestStreamUsesLatestLiveFlag(t *testing.T) {
+	sd, _, _, _ := loadSeed(t)
+	tok := sd.ids[0]
+	ref := sd.tokens[tok].gameRef
+	if sd.tokens[tok].live {
+		t.Skip("fixture token already live")
+	}
+	b := &bookImpl{}
+	raw, _ := json.Marshal(map[string]any{"event_type": "price_change", "timestamp": "1792966298032",
+		"price_changes": []any{map[string]any{"asset_id": tok, "best_bid": "0.60", "best_ask": "0.62"}}})
+	// No snapshot since connect: the seed's (pregame) flag.
+	ups, err := sd.apply(raw, time.Now(), b.liveOf)
+	if err != nil || len(ups) != 1 || ups[0].InPlay {
+		t.Fatalf("before kickoff: %+v %v", ups, err)
+	}
+	// A later snapshot sees the game in play; the running stream follows it.
+	b.live.Store(&map[string]bool{ref: true})
+	ups, err = sd.apply(raw, time.Now(), b.liveOf)
+	if err != nil || len(ups) != 1 || !ups[0].InPlay {
+		t.Fatalf("after kickoff: %+v %v", ups, err)
 	}
 }

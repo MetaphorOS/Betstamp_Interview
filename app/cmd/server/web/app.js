@@ -15,7 +15,11 @@ const state = {
   opens: 0,
   connected: false,
   debug: false,
-  lat: {},              // book -> {bookToServer: [], serverToYou: []}
+  lat: {},              // book -> {all|pregame|live: {e2e: [], b2s: [], s2y: []}}
+  clock: { valid: false }, // server clock vs NTP {offsetMs, errMs, measuredAt, valid}
+  bclock: null,         // browser clock vs server, from /api/ping {offset, err}
+  bsamples: [],         // recent ping-based clock samples
+  rttMs: [],            // browser <-> server round trips
 };
 function load(k, def) {
   try { return localStorage.getItem("odds." + k) || def; } catch { return def; }
@@ -30,7 +34,10 @@ let fullRender = true;
 const SHORT = { draftkings: "DK", fanduel: "FD", polymarket: "PM" };
 const short = (b) => SHORT[b] || b;
 const displayName = (b) => (state.books.find((x) => x.name === b) || {}).displayName || b;
-const serverNow = () => Date.now() + (state.offset || 0);
+// Server time now. The ping-based estimate (error ±half the round trip) is
+// used once it exists; until then only the coarse max-sample estimate, which
+// is good enough for "3s ago" labels but never feeds latency figures.
+const serverNow = () => Date.now() + (state.bclock ? state.bclock.offset : state.offset || 0);
 
 // ---- time & formatting ----------------------------------------------------
 function age(ms) {
@@ -111,7 +118,9 @@ function connect() {
   es.addEventListener("snapshot", (e) => onSnapshot(JSON.parse(e.data)));
   es.addEventListener("delta", (e) => onDelta(JSON.parse(e.data)));
   es.addEventListener("ping", (e) => {
-    sampleClock(JSON.parse(e.data).serverTime);
+    const p = JSON.parse(e.data);
+    sampleClock(p.serverTime);
+    if (p.clock) state.clock = p.clock;
     state.lastMsgAt = Date.now();
   });
 }
@@ -145,6 +154,7 @@ function onSnapshot(s) {
     state.slots.set(`${sl.g}|${sl.id}`, { family: sl.family, outcome: sl.outcome, entries: sl.entries || {}, best: sl.best || null });
   }
   state.health = s.health || {};
+  state.clock = s.clock || { valid: false };
   renderModes();
   fullRender = true;
   schedule();
@@ -163,6 +173,19 @@ function onDelta(d) {
       fullRender = true;
       schedule();
     }
+    return;
+  }
+  if (d.k === "confirm") {
+    // Unchanged prices re-confirmed by a stream frame, poll or snapshot:
+    // freshness only, so no flash.
+    for (const [key, at] of Object.entries(d.c || {})) {
+      const e = state.slots.get(key)?.entries[d.b];
+      if (e && at > (e.at || 0)) {
+        e.at = at;
+        dirty.add(gameOf(key));
+      }
+    }
+    schedule();
     return;
   }
   if (d.k === "game") {
@@ -186,14 +209,29 @@ function onDelta(d) {
     else if (d.e) sl.entries[d.b] = d.e;
   }
   sl.best = d.best || null;
-  if (d.src === "stream" && d.b && d.recv) {
-    const l = (state.lat[d.b] ||= { bookToServer: [], serverToYou: [] });
-    push(l.serverToYou, serverNow() - d.recv);
-    if (d.bts) push(l.bookToServer, d.recv - d.bts);
+  if (d.src === "stream" && d.b && d.recv && d.e && state.bclock) {
+    // Hops, all in server time. Nothing is recorded until the browser clock
+    // is estimated from pings; book clocks are compared only against a valid
+    // NTP-corrected server clock, so uncorrected samples never mix in.
+    const now = serverNow();
+    const s2y = now - d.recv;
+    const ok = d.bts && state.clock.valid;
+    const b2s = ok ? d.recv + state.clock.offsetMs - d.bts : null;
+    const e2e = ok ? now + state.clock.offsetMs - d.bts : null;
+    const byBook = (state.lat[d.b] ||= {});
+    for (const phase of ["all", d.e.live ? "live" : "pregame"]) {
+      const l = (byBook[phase] ||= { e2e: [], b2s: [], s2y: [] });
+      push(l.s2y, s2y);
+      if (b2s != null) push(l.b2s, b2s);
+      if (e2e != null) push(l.e2e, e2e);
+    }
   }
   dirty.add(d.g);
   schedule();
 }
+// A slot key is gameId|identity; the game id has "|" in it and the identity
+// has exactly 7 fields.
+const gameOf = (key) => key.split("|").slice(0, -7).join("|");
 function push(arr, v) {
   arr.push(v);
   if (arr.length > 300) arr.shift();
@@ -418,14 +456,50 @@ function healthCard(b) {
   const beatAge = h.lastBeatAt ? (serverNow() - h.lastBeatAt) / 1000 : null;
   const beatCls = beatAge == null ? "" : beatAge < 35 ? "ok" : beatAge < 90 ? "warn" : "bad";
   const pollAge = h.lastPollAt ? (serverNow() - h.lastPollAt) / 1000 : null;
-  const l = state.lat[b.name];
-  const b2s = l && quantile(l.bookToServer, 0.5);
-  const s2y = l && quantile(l.serverToYou, 0.5);
-  const s2y95 = l && quantile(l.serverToYou, 0.95);
-  const lat = [
-    b2s != null ? `book→server ${Math.round(b2s)} ms` : b.name === "fanduel" ? "book→server n/a (no book timestamp)" : null,
-    s2y != null ? `server→you ${Math.round(s2y)} ms (p95 ${Math.round(s2y95)})` : null,
-  ].filter(Boolean).join(" · ") || "waiting for stream updates";
+  const lat = state.lat[b.name] || {};
+  // Book -> screen needs the book's publish time; FanDuel frames have none.
+  const noBookTime = b.name === "fanduel";
+  const ms = (v) => `${Math.round(v)} ms`;
+  // Error bounds: server clock ±half its NTP round trip; browser clock
+  // ±half its ping round trip. book→screen carries both.
+  const pm = (v) => `±${Math.max(1, Math.round(v))}`;
+  const srvErr = state.clock.valid ? state.clock.errMs : null;
+  const brErr = state.bclock ? state.bclock.err : null;
+  const e2eText = (phase) => {
+    if (noBookTime) return `<span class="muted">—</span>`;
+    if (!state.bclock) return `<span class="muted">syncing browser clock…</span>`;
+    const l = lat[phase];
+    if (!l || !l.e2e.length) {
+      if (!state.clock.valid) return `<span class="warn">uncorrected: server clock unknown</span>`;
+      return `<span class="muted">waiting for ${phase === "all" ? "" : phase + " "}updates</span>`;
+    }
+    return `${ms(quantile(l.e2e, 0.5))} <span class="muted">${srvErr != null ? pm(srvErr + brErr) : "±?"} · p95 ${ms(quantile(l.e2e, 0.95))} · n=${l.e2e.length}</span>`;
+  };
+  const all = lat.all;
+  const hops = all
+    ? [
+        all.b2s.length ? `book→server ${ms(quantile(all.b2s, 0.5))} ${srvErr != null ? pm(srvErr) : ""}` : null,
+        `server→you ${ms(quantile(all.s2y, 0.5))} ${brErr != null ? pm(brErr) : ""}`,
+      ].filter(Boolean).join(" · ")
+    : "waiting for stream updates";
+  // Handshake: the same measure for every book, an app-level request and its
+  // reply at connect. Ping: each book's own keep-alive round trip.
+  const HS = {
+    draftkings: "subscribe → subscribed",
+    fanduel: "connection_init → ack",
+    polymarket: "PING → PONG once subscribed",
+  };
+  const hs = h.handshakeMs
+    ? `${ms(h.handshakeMs)} <span class="muted">${esc(HS[b.name] || "request → reply")} · ${age(h.handshakeAt)}</span>`
+    : `<span class="muted">waiting for a connect</span>`;
+  const PING = {
+    draftkings: "socket ping→pong",
+    fanduel: "socket ping→pong; FanDuel holds pongs ~1 s",
+    polymarket: "PING→PONG message",
+  };
+  const ping = h.pingMs
+    ? `${ms(h.pingMs)} <span class="muted">p50 ${ms(h.pingP50Ms)} · ${esc(PING[b.name] || "ping")}</span>`
+    : `<span class="muted">waiting for a pong</span>`;
   const debug = state.debug
     ? `<div class="hbtns">
          <button type="button" data-kill="${esc(b.name)}" title="Close the book's socket; the supervisor reconnects">Drop socket</button>
@@ -440,7 +514,12 @@ function healthCard(b) {
     <div class="hrow"><span>Snapshots</span><span>${h.snapshots || 0} ok · <span class="${h.snapshotErrors ? "bad" : ""}">${h.snapshotErrors || 0} failed</span>${h.lastSnapshotAt ? ` · last ${age(h.lastSnapshotAt)}` : ""}</span></div>
     <div class="hrow"><span>Recovery</span><span><span class="${h.reconnects ? "warn" : ""}">${h.reconnects || 0} reconnects</span> · <span class="${h.resyncs ? "warn" : ""}">${h.resyncs || 0} resyncs</span></span></div>
     <div class="hrow"><span>Data</span><span>last ${age(h.lastDataAt)} · ${h.updates || 0} updates</span></div>
-    <div class="hrow"><span>Latency</span><span>${lat}</span></div>
+    <div class="hrow" title="Book publish time to this page handling the update, p50 over recent stream updates (clock-corrected)"><span>Latency</span><span>${e2eText("all")}</span></div>
+    <div class="hrow sub"><span>pregame</span><span>${e2eText("pregame")}</span></div>
+    <div class="hrow sub"><span>live</span><span>${e2eText("live")}</span></div>
+    <div class="hrow sub"><span>hops</span><span class="muted">${hops}</span></div>
+    <div class="hrow" title="App-level request and its reply when the socket connects: the same measure for every book"><span>Handshake</span><span>${hs}</span></div>
+    <div class="hrow" title="Each book's keep-alive round trip, repeated while connected"><span>Ping</span><span>${ping}</span></div>
     ${h.lastError ? `<div class="herr" title="last error">last error: ${esc(h.lastError)}</div>` : ""}
     ${h.lastPollError ? `<div class="herr">poll error: ${esc(h.lastPollError)}</div>` : ""}
     ${debug}
@@ -470,10 +549,36 @@ function renderConn() {
   }
   const reconnects = Math.max(0, state.opens - 1);
   text += ` · ${reconnects} reconnect${reconnects === 1 ? "" : "s"}`;
-  if (state.offset != null) text += ` · clock ${state.offset >= 0 ? "+" : ""}${state.offset} ms`;
+  if (state.rttMs.length) text += ` · ping ${Math.round(quantile(state.rttMs, 0.5))} ms`;
+  if (state.bclock) text += ` · clock sync ±${state.bclock.err.toFixed(1)} ms`;
+  text += state.clock.valid ? ` · server NTP ±${state.clock.errMs.toFixed(1)} ms` : " · server NTP unknown";
   el.className = cls;
   el.querySelector(".conn-text").textContent = text;
 }
+
+// Browser <-> server round trip, and the browser clock estimate (Cristian):
+// the server stamped serverTime somewhere inside the round trip, so assume
+// the midpoint; the error is at most half the round trip (+0.5 ms for the
+// millisecond timestamp). The lowest-round-trip recent sample wins.
+async function pingServer() {
+  const t0 = performance.now();
+  try {
+    const r = await fetch("/api/ping", { cache: "no-store" });
+    const { serverTime } = await r.json();
+    const rtt = performance.now() - t0;
+    const mid = Date.now() - rtt / 2;
+    state.rttMs.push(rtt);
+    if (state.rttMs.length > 30) state.rttMs.shift();
+    state.bsamples.push({ offset: serverTime - mid, err: rtt / 2 + 0.5 });
+    if (state.bsamples.length > 30) state.bsamples.shift();
+    state.bclock = state.bsamples.reduce((a, b) => (b.err < a.err ? b : a));
+    renderConn();
+  } catch {}
+}
+// A quick burst so the estimate is usable within a couple of seconds, then
+// every 10 s (30 samples: the last 5 minutes).
+for (let i = 0; i < 5; i++) setTimeout(pingServer, i * 300);
+setInterval(pingServer, 10000);
 
 fetch("/debug").then((r) => r.json()).then((d) => { state.debug = !!d.enabled; renderHealth(); }).catch(() => {});
 connect();

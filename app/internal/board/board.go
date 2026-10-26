@@ -47,6 +47,10 @@ type Health struct {
 	Snapshots       int64     `json:"snapshots"`
 	SnapshotErrors  int64     `json:"snapshotErrors"`
 	LastSnapshotAt  time.Time `json:"lastSnapshotAt,omitzero"` // last successful snapshot
+	PingLastMs      float64   `json:"pingLastMs,omitempty"`    // socket ping round trip to the book
+	PingP50Ms       float64   `json:"pingP50Ms,omitempty"`
+	HandshakeMs     float64   `json:"handshakeMs,omitempty"` // app-level request -> reply at the last connect
+	HandshakeAt     time.Time `json:"handshakeAt,omitzero"`
 }
 
 // healthRefresh: even without a state change, re-publish health this often so
@@ -88,24 +92,29 @@ const (
 	KindSlot   DeltaKind = "slot"
 	KindHealth DeltaKind = "health"
 	KindGame   DeltaKind = "game"
+	// KindConfirm lists entries whose unchanged price a stream frame, poll
+	// or snapshot re-confirmed. Without it the page would only learn a
+	// price's age when the price changed.
+	KindConfirm DeltaKind = "confirm"
 )
 
 // Delta is one visible change.
 type Delta struct {
-	Seq       uint64       `json:"seq"`
-	Kind      DeltaKind    `json:"kind"`
-	GameID    string       `json:"gameId,omitempty"`
-	Identity  string       `json:"identity,omitempty"`
-	Book      string       `json:"book,omitempty"`
-	Entry     *Entry       `json:"entry,omitempty"`   // nil with Removed: the book left the slot
-	Removed   bool         `json:"removed,omitempty"` // entry (slot) or game removed
-	Best      *Best        `json:"best,omitempty"`    // nil: no eligible price
-	Health    *Health      `json:"health,omitempty"`
-	Game      *GameView    `json:"game,omitempty"`
-	Source    model.Source `json:"source,omitempty"` // how the update that caused this arrived
-	RecvAt    time.Time    `json:"recvAt,omitzero"`
-	BookTS    time.Time    `json:"bookTs,omitzero"`
-	AppliedAt time.Time    `json:"appliedAt"`
+	Seq       uint64               `json:"seq"`
+	Kind      DeltaKind            `json:"kind"`
+	GameID    string               `json:"gameId,omitempty"`
+	Identity  string               `json:"identity,omitempty"`
+	Book      string               `json:"book,omitempty"`
+	Entry     *Entry               `json:"entry,omitempty"`   // nil with Removed: the book left the slot
+	Removed   bool                 `json:"removed,omitempty"` // entry (slot) or game removed
+	Best      *Best                `json:"best,omitempty"`    // nil: no eligible price
+	Health    *Health              `json:"health,omitempty"`
+	Game      *GameView            `json:"game,omitempty"`
+	Confirms  map[string]time.Time `json:"confirms,omitempty"` // KindConfirm: "gameId|identity" -> confirmed at
+	Source    model.Source         `json:"source,omitempty"`   // how the update that caused this arrived
+	RecvAt    time.Time            `json:"recvAt,omitzero"`
+	BookTS    time.Time            `json:"bookTs,omitzero"`
+	AppliedAt time.Time            `json:"appliedAt"`
 }
 
 // GameView is a canonical game as the page shows it.
@@ -137,7 +146,7 @@ type State struct {
 	Games   []GameView              `json:"games"`
 	Slots   []SlotView              `json:"slots"`
 	Health  map[string]Health       `json:"health"`
-	Latency map[string]LatencyStats `json:"latency"`
+	Latency map[string]LatencySplit `json:"latency"`
 	Dropped map[string]int          `json:"dropped,omitempty"` // updates for unknown games, per book
 }
 
@@ -195,6 +204,28 @@ func (c *core) gameStatus(gs *gameState, now time.Time) string {
 	}
 }
 
+// flushConfirms publishes one confirmation delta per book, coalesced since
+// the last tick. Confirmations are freshness only; they never move a price.
+func (c *core) flushConfirms(now time.Time) {
+	names := make([]string, 0, len(c.confirmed))
+	for name := range c.confirmed {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		m := c.confirmed[name]
+		for key := range m {
+			if s := c.slots[key]; s == nil || s.entries[name].UpdatedAt.IsZero() {
+				delete(m, key) // the entry went away since
+			}
+		}
+		if len(m) > 0 {
+			c.publish(Delta{Kind: KindConfirm, Book: name, Confirms: m, AppliedAt: now})
+		}
+		delete(c.confirmed, name)
+	}
+}
+
 // refreshGame recomputes one game's status and publishes a change.
 func (c *core) refreshGame(gid string, now time.Time) {
 	gs := c.games[gid]
@@ -210,8 +241,10 @@ func (c *core) refreshGame(gid string, now time.Time) {
 	c.publish(Delta{Kind: KindGame, GameID: gid, Game: &v, AppliedAt: now})
 }
 
-// tick runs the time-based transitions: suspended -> closed -> pruned.
+// tick runs the time-based work: confirmations, then game transitions
+// suspended -> closed -> pruned.
 func (c *core) tick(now time.Time) {
+	c.flushConfirms(now)
 	ids := make([]string, 0, len(c.games))
 	for id := range c.games {
 		ids = append(ids, id)
@@ -256,7 +289,8 @@ type core struct {
 	games      map[string]*gameState
 	slots      map[string]*slot
 	health     map[string]Health
-	latency    map[string]*latencyWindow
+	latency    map[string]*splitWindow
+	confirmed  map[string]map[string]time.Time // book -> slot key -> confirmed at, since the last tick
 	dropped    map[string]int
 	healthSent map[string]time.Time
 	seq        uint64
@@ -274,13 +308,13 @@ func newCore(books []book.Descriptor, now func() time.Time, opts Options) *core 
 	c := &core{
 		opts: opts, now: now, matcher: match.New(), books: books, kind: map[string]book.PriceKind{},
 		gameRefs: map[string]map[string]string{}, games: map[string]*gameState{},
-		slots: map[string]*slot{}, health: map[string]Health{}, latency: map[string]*latencyWindow{},
+		slots: map[string]*slot{}, health: map[string]Health{}, latency: map[string]*splitWindow{}, confirmed: map[string]map[string]time.Time{},
 		dropped: map[string]int{}, subs: map[int]chan Delta{}, healthSent: map[string]time.Time{},
 	}
 	for _, d := range books {
 		c.kind[d.Name] = d.PriceKind
 		c.health[d.Name] = Health{State: HealthStarting, Since: now()}
-		c.latency[d.Name] = newLatencyWindow(latencyWindowSize)
+		c.latency[d.Name] = newSplitWindow()
 	}
 	return c
 }
@@ -415,7 +449,7 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	}
 	defer c.refreshGame(gid, appliedAt)
 	if lw := c.latency[u.Book]; lw != nil && u.Source == model.SourceStream {
-		lw.add(appliedAt.Sub(u.RecvAt), u.RecvAt, u.BookTS)
+		lw.add(appliedAt.Sub(u.RecvAt), u.RecvAt, u.BookTS, u.InPlay)
 	}
 	key := gid + "|" + u.Identity
 	s := c.slots[key]
@@ -453,6 +487,10 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 			if e.UpdatedAt.After(old.UpdatedAt) {
 				old.UpdatedAt, old.BookTS, old.Decimal = e.UpdatedAt, e.BookTS, e.Decimal
 				s.entries[u.Book] = old
+				if c.confirmed[u.Book] == nil {
+					c.confirmed[u.Book] = map[string]time.Time{}
+				}
+				c.confirmed[u.Book][key] = e.UpdatedAt
 			}
 			return
 		}
@@ -558,7 +596,7 @@ func (c *core) setHealth(name string, h Health) {
 func (c *core) state() State {
 	st := State{
 		Seq: c.seq, Options: c.opts, Books: append([]book.Descriptor(nil), c.books...),
-		Health: map[string]Health{}, Latency: map[string]LatencyStats{}, Dropped: map[string]int{},
+		Health: map[string]Health{}, Latency: map[string]LatencySplit{}, Dropped: map[string]int{},
 	}
 	for k, v := range c.health {
 		st.Health[k] = v

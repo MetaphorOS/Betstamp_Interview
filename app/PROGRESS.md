@@ -40,8 +40,29 @@ live runs from the Ontario dev PC on 2026-10-25/26. Re-run with:
   selection ID comes back when a line moves back.
 - FD soak conn 3 subscribed to only 36 markets, because the 17:00 discovery
   board had dropped the 7 games that had kicked off. This is why the app
-  merges `/api/in-play` into the snapshot. Live runs confirm it: FD shows
-  the in-play PHI @ KC game.
+  merges `/api/in-play` into the snapshot. (An earlier version of this note
+  said live runs confirmed it with an in-play PHI @ KC game. That "game" was
+  FanDuel esports; see the correction below. The merge itself is right.)
+
+## Correction (2026-10-26): FanDuel esports counted as NFL
+
+FanDuel files esports under the same sport type as the real NFL. Example
+from its live board: "Philadelphia Eagles (OFFICER) @ Detroit Lions
+(MEMENTO)" in competition "eFootball H2H GG League 4x4mins" (12787949), a
+video-game match with 4-minute quarters. The NFL filter only checked the sport
+type (6423), and the team matcher found "Eagles" and "Lions", so these showed
+up as live NFL games at odd hours (PHI @ KC at 00:03Z, SF @ KC at 01:35Z, WAS
+@ BUF at 03:49Z, PHI @ DET at 05:01Z).
+
+Fixed: a FanDuel event must be in the league's real competition, by ID (NFL
+12282733, NBA 10547864) or by the attached competition name ("NFL", "NBA").
+The NBA filter already did this by ID; its 30 refused markets turn out to be
+"eBasketball H2H GG League" esports. Test: `TestEsportsWithNFLTeamNamesRefused`.
+
+So the FanDuel rows in the live-run tables below overstate it: the 18
+"in-play slots" were 3 games, of which only KC @ SEA (6 slots) was real.
+DraftKings and Polymarket were not affected (DK reads the NFL league
+directly; Polymarket's NFL series has no esports).
 
 ## Live findings
 
@@ -93,10 +114,12 @@ comes from Gamma snapshots. In the next run it showed 6.
   from a 41 s-old snapshot because the discovery limit forbade a new one.
 - Shutdown on timeout/Ctrl+C: 0–1 ms.
 
-## Not done / not verified
+## Not done / not verified (as of 2026-10-26 05:15Z)
 
-- Section 13 (SSE hub, UI, Fly deploy, README) has not been started.
-- No Fly-IP probe yet, so it is unknown whether DK/FD block datacenter IPs.
-- The FD `ErrAuth` → bundle-refresh path is unit-level only. No auth
-  rejection happened live.
-- Polymarket in-play only updates on snapshots (every 30 s+).
+- Deployed at https://betstamp-odds.fly.dev (yyz) behind a static egress IP
+  (209.71.100.151): Fly host IPs in 185.156.47.x were 403'd by DK and FD's
+  homepage. Not yet watched for hours, or through a live game, from Fly.
+- Live latency (book→screen, pregame vs live) not yet recorded with the
+  current method; README not written; no GitHub repo.
+- The FD `ErrAuth` → bundle-refresh path and app-key rotation are tested
+  with fakes only; no real rejection has happened live.

@@ -385,3 +385,45 @@ func TestPregameSuspensionIsNotClosed(t *testing.T) {
 		t.Fatalf("status %q, want pregame", st)
 	}
 }
+
+func TestConfirmationsReachSubscribers(t *testing.T) {
+	c := newTestCore()
+	id := ml("nfl-vikings")
+	c.apply(upd("dk", "dk-g", id, nil, 150, t0), t0)
+	_, drain := collect(c)
+	// A poll sees the same price a minute later: no price delta...
+	poll := upd("dk", "dk-g", id, nil, 150, t0.Add(time.Minute))
+	poll.Source, poll.AsOf = model.SourcePoll, t0.Add(time.Minute)
+	c.apply(poll, t0.Add(time.Minute))
+	if ds := drain(); len(ds) != 0 {
+		t.Fatalf("unchanged price emitted %+v", ds)
+	}
+	// ...but the next tick tells the page it was confirmed.
+	c.tick(t0.Add(time.Minute + 5*time.Second))
+	ds := drain()
+	key := slotKey(c, "dk", "dk-g", id)
+	if len(ds) != 1 || ds[0].Kind != KindConfirm || ds[0].Book != "dk" || !ds[0].Confirms[key].Equal(t0.Add(time.Minute)) {
+		t.Fatalf("deltas %+v", ds)
+	}
+	c.tick(t0.Add(2 * time.Minute))
+	if ds := drain(); len(ds) != 0 {
+		t.Fatalf("confirmation repeated: %+v", ds)
+	}
+}
+
+func TestLatencySplitsPregameAndLive(t *testing.T) {
+	c := newTestCore()
+	pre := upd("dk", "dk-g", ml("nfl-vikings"), nil, 150, t0)
+	pre.BookTS = t0.Add(-30 * time.Millisecond)
+	c.apply(pre, t0)
+	live := upd("dk", "dk-g", ml("nfl-colts"), nil, -170, t0)
+	live.InPlay, live.BookTS = true, t0.Add(-80*time.Millisecond)
+	c.apply(live, t0)
+	l := c.state().Latency["dk"]
+	if l.All.BookSamples != 2 || l.Pregame.BookSamples != 1 || l.Live.BookSamples != 1 {
+		t.Fatalf("split %+v", l)
+	}
+	if l.Pregame.BookP50ms != 30 || l.Live.BookP50ms != 80 {
+		t.Fatalf("pregame %v live %v", l.Pregame.BookP50ms, l.Live.BookP50ms)
+	}
+}

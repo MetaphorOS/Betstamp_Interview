@@ -13,6 +13,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -26,6 +27,7 @@ import (
 	"betstampodds/internal/board"
 	"betstampodds/internal/book"
 	"betstampodds/internal/books"
+	"betstampodds/internal/clocksync"
 	"betstampodds/internal/fanout"
 	"betstampodds/internal/supervisor"
 )
@@ -34,6 +36,7 @@ func main() {
 	addr := flag.String("addr", ":"+envOr("PORT", "8080"), "listen address")
 	bundle := flag.String("fd-bundle", os.Getenv("FD_MAIN_JS"), "captured FanDuel main.js fallback")
 	pmBest := flag.Bool("pm-best", os.Getenv("PM_IN_BEST") != "0", "let prediction markets (priced at the ask) win best price")
+	ntp := flag.String("ntp", envOr("NTP_SERVER", "time.google.com"), "SNTP server for the clock-offset correction (empty = off)")
 	debug := flag.Bool("debug", os.Getenv("DEBUG_ENDPOINTS") == "1", "enable POST /debug/kill/{book} and /debug/pause/{book}")
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
@@ -64,15 +67,58 @@ func main() {
 		go func() { defer wg.Done(); s.Run(ctx) }()
 	}
 
+	// Books block by IP reputation (DK's Akamai 403s some datacenter IPs), and
+	// a cloud machine's outgoing IP is its host's: log it so a block can be
+	// tied to an address.
+	go func() {
+		ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		req, _ := http.NewRequestWithContext(ctx, http.MethodGet, "https://api.ipify.org", nil)
+		if resp, err := http.DefaultClient.Do(req); err == nil {
+			raw, _ := io.ReadAll(io.LimitReader(resp.Body, 64))
+			resp.Body.Close()
+			log.Info("egress ip", "ip", string(raw), "region", os.Getenv("FLY_REGION"), "machine", os.Getenv("FLY_MACHINE_ID"))
+		}
+	}()
+
+	// Book-to-us latency subtracts a book's clock from ours, so measure how
+	// far ours is from NTP and let the page correct for it.
+	if *ntp != "" {
+		go func() {
+			for {
+				// Every 60 s: well inside ClockMaxAge, so one failed
+				// measurement does not invalidate the clock.
+				if off, rtt, err := clocksync.Best(*ntp, 4, 2*time.Second); err == nil {
+					hub.SetClock(off, rtt, time.Now())
+					log.Info("clock offset", "server", *ntp, "offsetMs", float64(off.Microseconds())/1000,
+						"rttMs", float64(rtt.Microseconds())/1000)
+				} else {
+					log.Warn("clock offset unavailable", "error", err)
+				}
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(time.Minute):
+				}
+			}
+		}()
+	}
+
 	mux := http.NewServeMux()
 	mux.Handle("GET /stream", hub)
+	mux.HandleFunc("GET /api/ping", func(w http.ResponseWriter, r *http.Request) {
+		// The page times this round trip: browser <-> server latency.
+		writeJSON(w, map[string]any{"serverTime": time.Now().UnixMilli()})
+	})
 	mux.HandleFunc("GET /api/board", func(w http.ResponseWriter, r *http.Request) {
 		_, st, err := bd.Snapshot(r.Context())
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		writeJSON(w, fanout.WireStateOf(st))
+		ws := fanout.WireStateOf(st)
+		ws.Clock = hub.Clock()
+		writeJSON(w, ws)
 	})
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		_, st, err := bd.Snapshot(r.Context())
@@ -90,7 +136,7 @@ func main() {
 			http.Error(w, err.Error(), http.StatusServiceUnavailable)
 			return
 		}
-		writeMetrics(w, st, hub.Stats())
+		writeMetrics(w, st, hub.Stats(), hub.Clock())
 	})
 	mux.HandleFunc("GET /debug", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, map[string]any{"enabled": *debug})
@@ -168,7 +214,7 @@ var healthValue = map[board.HealthState]int{
 	board.HealthStarting: 0, board.HealthLive: 1, board.HealthDegraded: 2, board.HealthStale: 3, board.HealthDown: 4,
 }
 
-func writeMetrics(w http.ResponseWriter, st board.State, hs fanout.Stats) {
+func writeMetrics(w http.ResponseWriter, st board.State, hs fanout.Stats, clock fanout.Clock) {
 	w.Header().Set("Content-Type", "text/plain; version=0.0.4")
 	names := make([]string, 0, len(st.Health))
 	for n := range st.Health {
@@ -178,19 +224,40 @@ func writeMetrics(w http.ResponseWriter, st board.State, hs fanout.Stats) {
 	fmt.Fprintln(w, "# HELP odds_book_health 0=starting 1=live 2=degraded 3=stale 4=down")
 	for _, n := range names {
 		h := st.Health[n]
-		l := st.Latency[n]
+		split := st.Latency[n]
 		fmt.Fprintf(w, "odds_book_health{book=%q} %d\n", n, healthValue[h.State])
 		fmt.Fprintf(w, "odds_book_reconnects_total{book=%q} %d\n", n, h.Reconnects)
 		fmt.Fprintf(w, "odds_book_resyncs_total{book=%q} %d\n", n, h.Resyncs)
 		fmt.Fprintf(w, "odds_book_updates_total{book=%q} %d\n", n, h.Updates)
-		fmt.Fprintf(w, "odds_book_process_us{book=%q,q=\"0.5\"} %g\n", n, l.ProcessP50us)
-		fmt.Fprintf(w, "odds_book_process_us{book=%q,q=\"0.95\"} %g\n", n, l.ProcessP95us)
-		if l.BookSamples > 0 {
-			fmt.Fprintf(w, "odds_book_to_us_ms{book=%q,q=\"0.5\"} %g\n", n, l.BookP50ms)
-			fmt.Fprintf(w, "odds_book_to_us_ms{book=%q,q=\"0.95\"} %g\n", n, l.BookP95ms)
+		fmt.Fprintf(w, "odds_book_ping_ms{book=%q} %g\n", n, h.PingLastMs)
+		fmt.Fprintf(w, "odds_book_handshake_ms{book=%q} %g\n", n, h.HandshakeMs)
+		for _, ph := range []struct {
+			name string
+			l    board.LatencyStats
+		}{{"all", split.All}, {"pregame", split.Pregame}, {"live", split.Live}} {
+			l := ph.l
+			fmt.Fprintf(w, "odds_book_process_us{book=%q,phase=%q,q=\"0.5\"} %g\n", n, ph.name, l.ProcessP50us)
+			fmt.Fprintf(w, "odds_book_process_us{book=%q,phase=%q,q=\"0.95\"} %g\n", n, ph.name, l.ProcessP95us)
+			if l.BookSamples > 0 {
+				// Raw: add odds_clock_offset_ms (only while odds_clock_valid
+				// is 1) for the NTP-corrected value.
+				fmt.Fprintf(w, "odds_book_to_us_ms{book=%q,phase=%q,q=\"0.5\"} %g\n", n, ph.name, l.BookP50ms)
+				fmt.Fprintf(w, "odds_book_to_us_ms{book=%q,phase=%q,q=\"0.95\"} %g\n", n, ph.name, l.BookP95ms)
+			}
 		}
 		fmt.Fprintf(w, "odds_board_dropped_updates_total{book=%q} %d\n", n, st.Dropped[n])
 	}
+	valid, age := 0, -1.0
+	if clock.Valid {
+		valid = 1
+	}
+	if clock.MeasuredAt != 0 {
+		age = float64(time.Now().UnixMilli()-clock.MeasuredAt) / 1000
+	}
+	fmt.Fprintf(w, "odds_clock_offset_ms %g\n", clock.OffsetMs)
+	fmt.Fprintf(w, "odds_clock_error_ms %g\n", clock.ErrMs)
+	fmt.Fprintf(w, "odds_clock_valid %d\n", valid)
+	fmt.Fprintf(w, "odds_clock_age_seconds %g\n", age)
 	fmt.Fprintf(w, "odds_board_seq %d\n", st.Seq)
 	fmt.Fprintf(w, "odds_board_slots %d\n", len(st.Slots))
 	fmt.Fprintf(w, "odds_sse_clients %d\n", hs.Clients)

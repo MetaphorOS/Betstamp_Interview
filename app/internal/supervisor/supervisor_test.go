@@ -333,3 +333,22 @@ func TestPauseGoesStaleThenRecovers(t *testing.T) {
 	}
 	eventually(t, "live after pause", func() bool { return s.Health().State == board.HealthLive })
 }
+
+func TestPongRoundTripInHealth(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{
+		func(ctx context.Context, em book.Emitter) error {
+			em.Connected()
+			em.Handshake(60 * time.Millisecond)
+			for _, ms := range []int{30, 10, 20} {
+				em.Pong(time.Duration(ms) * time.Millisecond)
+			}
+			return liveUntilCancel("a")(ctx, em)
+		},
+	}}
+	s, stop := run(t, fb, newSink(), testConfig())
+	defer stop()
+	eventually(t, "ping in health", func() bool { h := s.Health(); return h.PingLastMs == 20 && h.PingP50Ms == 20 })
+	if h := s.Health(); h.HandshakeMs != 60 || h.HandshakeAt.IsZero() {
+		t.Fatalf("handshake %v at %v", h.HandshakeMs, h.HandshakeAt)
+	}
+}

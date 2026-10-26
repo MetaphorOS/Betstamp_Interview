@@ -15,10 +15,12 @@ import (
 )
 
 // Bundle is the rotating public configuration in FanDuel's frontend JS: the
-// AppSync client id and the subscription document.
+// AppSync client id, the subscription document, and the app key (_ak) the
+// REST boards require.
 type Bundle struct {
 	Source            string // URL or file path it came from
 	ClientID          string
+	AppKey            string // "" when not found; callers fall back
 	SubscriptionQuery string
 	SnapshotQuery     string
 }
@@ -29,6 +31,12 @@ var (
 	snapshotRE     = regexp.MustCompile(`(?s)query GetMarketPrices\(\$ids: \[String\]!\) \{.*?\n    \}`)
 	mainJSRE       = regexp.MustCompile(`/static/js/main\.[0-9a-f]+\.js`)
 	depsJSRE       = regexp.MustCompile(`/static/js/dependencies\.[0-9a-f]+\.js`)
+	// The app key is a minified constant declared right after the
+	// environment enum (...SB_STUBS_REMOTE="SB_STUBS_REMOTE";let g="<16>").
+	// The variable name changes every build, so anchor on the enum, not it.
+	appKeyRE = regexp.MustCompile(`"SB_STUBS_REMOTE";let [\w$]+="([A-Za-z0-9]{16})"`)
+	// Looser fallback: the first 16-character literal shortly after the enum.
+	appKeyNearRE = regexp.MustCompile(`SB_STUBS_REMOTE[^;]*;[^"]{0,40}"([A-Za-z0-9]{16})"`)
 )
 
 // parseBundle fills whatever parts the source contains.
@@ -43,6 +51,13 @@ func parseBundle(b *Bundle, source string) {
 	}
 	if b.SnapshotQuery == "" {
 		b.SnapshotQuery = snapshotRE.FindString(source)
+	}
+	if b.AppKey == "" {
+		if m := appKeyRE.FindStringSubmatch(source); len(m) == 2 {
+			b.AppKey = m[1]
+		} else if m := appKeyNearRE.FindStringSubmatch(source); len(m) == 2 {
+			b.AppKey = m[1]
+		}
 	}
 }
 
@@ -81,7 +96,18 @@ func newBundleProvider(hc *http.Client, cfg Config) *bundleProvider {
 	return &bundleProvider{hc: hc, homeURL: cfg.HomeURL, path: cfg.BundlePath, ua: cfg.UserAgent}
 }
 
-// invalidate forces a refresh before the next connect (after ErrAuth).
+// appKey is the current bundle's app key without fetching, or "".
+func (p *bundleProvider) appKey() string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.cur == nil {
+		return ""
+	}
+	return p.cur.AppKey
+}
+
+// invalidate forces a refresh before the next connect (after ErrAuth) or
+// the next snapshot (after the boards reject the app key).
 func (p *bundleProvider) invalidate() {
 	p.mu.Lock()
 	p.invalid = true
@@ -107,9 +133,14 @@ func (p *bundleProvider) get(ctx context.Context) (*Bundle, error) {
 			return nil, fmt.Errorf("fanduel: no bundle (live: %v; file: %w)", p.lastLive, err)
 		}
 	}
-	if p.cur == nil || p.cur.ClientID != b.ClientID {
+	if p.cur == nil || p.cur.ClientID != b.ClientID || p.cur.AppKey != b.AppKey {
+		old := &Bundle{}
+		if p.cur != nil {
+			old = p.cur
+		}
 		slog.Info("fanduel bundle loaded", "source", b.Source,
-			"oldClientID", prefix(clientIDOf(p.cur)), "newClientID", prefix(b.ClientID))
+			"oldClientID", prefix(old.ClientID), "newClientID", prefix(b.ClientID),
+			"oldAppKey", prefix(old.AppKey), "newAppKey", prefix(b.AppKey))
 	}
 	p.cur, p.gotAt, p.invalid = b, time.Now(), false
 	return b, nil
@@ -163,7 +194,7 @@ func (p *bundleProvider) fetchLive(ctx context.Context) (*Bundle, error) {
 	}
 	b := &Bundle{Source: mainURL}
 	parseBundle(b, src)
-	if !b.complete() {
+	if !b.complete() || b.AppKey == "" {
 		if dep := depsJSRE.FindString(html); dep != "" {
 			if depSrc, err := p.getText(ctx, resolveRef(p.homeURL, dep)); err == nil {
 				parseBundle(b, depSrc)

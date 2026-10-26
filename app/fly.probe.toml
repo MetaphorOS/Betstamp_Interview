@@ -11,10 +11,11 @@ primary_region = "yyz"
   [build.args]
     CMD = "probe"
 
-[experimental]
-  cmd = ["-serve", ":8080", "-listen", "15s"]
+[processes]
+  app = "-serve :8080 -listen 15s"
 
 [http_service]
+  processes = ["app"]
   internal_port = 8080
   force_https = true
   auto_stop_machines = "stop"

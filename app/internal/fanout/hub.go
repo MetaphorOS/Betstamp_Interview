@@ -54,6 +54,9 @@ type Hub struct {
 	clients map[*client]struct{}
 	ready   chan struct{}
 
+	clockMu sync.Mutex
+	clock   clockReading // server clock vs NTP
+
 	// metrics
 	deltas      atomic.Int64
 	bytesOut    atomic.Int64
@@ -80,6 +83,50 @@ func New(src Source, cfg Config) *Hub {
 	}
 	return &Hub{src: src, cfg: cfg, log: cfg.Logger.With("component", "fanout"),
 		clients: map[*client]struct{}{}, ready: make(chan struct{})}
+}
+
+type clockReading struct {
+	offset, rtt time.Duration
+	at          time.Time // zero: never measured
+}
+
+// ClockMaxAge: an offset older than this no longer counts as known. Clocks
+// being adjusted (this Windows PC moved ~90 ms between runs) drift away from
+// an old reading, so stale is treated like unknown, not like zero.
+const ClockMaxAge = 2 * time.Minute
+
+// Clock is this server's clock versus NTP, as sent to the page. Offset is
+// NTP minus local (negative: our clock runs ahead). ErrMs is the worst-case
+// error: half the NTP round trip. Valid is false when the offset was never
+// measured or is older than ClockMaxAge; corrected latency must not use it.
+type Clock struct {
+	OffsetMs   float64 `json:"offsetMs"`
+	ErrMs      float64 `json:"errMs"`
+	MeasuredAt int64   `json:"measuredAt,omitempty"`
+	Valid      bool    `json:"valid"`
+}
+
+// SetClock records one successful NTP measurement.
+func (h *Hub) SetClock(offset, rtt time.Duration, at time.Time) {
+	h.clockMu.Lock()
+	h.clock = clockReading{offset: offset, rtt: rtt, at: at}
+	h.clockMu.Unlock()
+}
+
+// Clock reports the offset with its validity at now.
+func (h *Hub) Clock() Clock { return h.clockAt(time.Now()) }
+
+func (h *Hub) clockAt(now time.Time) Clock {
+	h.clockMu.Lock()
+	r := h.clock
+	h.clockMu.Unlock()
+	if r.at.IsZero() {
+		return Clock{}
+	}
+	return Clock{
+		OffsetMs: float64(r.offset.Microseconds()) / 1000, ErrMs: float64(r.rtt.Microseconds()) / 2000,
+		MeasuredAt: r.at.UnixMilli(), Valid: now.Sub(r.at) <= ClockMaxAge,
+	}
 }
 
 // Run consumes the board until ctx ends, resubscribing if the board drops us.
@@ -261,7 +308,9 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return
 		}
-		data, err := json.Marshal(wireState(st))
+		ws := wireState(st)
+		ws.Clock = h.Clock()
+		data, err := json.Marshal(ws)
 		if err != nil {
 			return
 		}
@@ -280,7 +329,8 @@ func (h *Hub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			return
 		case <-ping.C:
 			// A named event, not a comment, so the page can read serverTime.
-			if !write(sseEvent(0, "ping", fmt.Appendf(nil, `{"serverTime":%d}`, time.Now().UnixMilli()))) {
+			cj, _ := json.Marshal(h.Clock())
+			if !write(sseEvent(0, "ping", fmt.Appendf(nil, `{"serverTime":%d,"clock":%s}`, time.Now().UnixMilli(), cj))) {
 				return
 			}
 			fl.Flush()

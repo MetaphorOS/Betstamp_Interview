@@ -50,10 +50,16 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
 
+	// The subscription must be the first message (anything else is closed
+	// with 1008), and its first reply is the full book for every token, so it
+	// is not a light request/reply. Handshake timing is instead a PING sent as
+	// soon as that first message arrives (anything sent earlier queues behind
+	// the book: ~580 ms measured), timed to its PONG.
 	sub, _ := json.Marshal(map[string]any{"assets_ids": sd.ids, "type": "market"})
 	if err := write(websocket.TextMessage, sub); err != nil {
 		return fmt.Errorf("polymarket: subscribe: %w", err)
 	}
+	var handshakeSent time.Time
 
 	type frame struct {
 		raw    []byte
@@ -79,11 +85,13 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 	ping := time.NewTicker(pingEvery)
 	defer ping.Stop()
 	connected := false
+	var pingSent time.Time // only this loop touches it
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ping.C:
+			pingSent = time.Now()
 			if err := write(websocket.TextMessage, []byte("PING")); err != nil {
 				return fmt.Errorf("polymarket: ping: %w", err)
 			}
@@ -98,13 +106,27 @@ func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emit
 				return fmt.Errorf("polymarket: ws read: %w", f.err)
 			}
 			em.Heartbeat()
+			if string(f.raw) == "PONG" {
+				if !handshakeSent.IsZero() {
+					em.Handshake(f.recvAt.Sub(handshakeSent))
+					handshakeSent = time.Time{}
+				} else if !pingSent.IsZero() {
+					em.Pong(f.recvAt.Sub(pingSent))
+					pingSent = time.Time{}
+				}
+				continue
+			}
 			if !connected {
 				// No ack on this channel: the first message (the book
 				// snapshot for our tokens) means the subscription is live.
 				connected = true
 				em.Connected()
+				handshakeSent = time.Now()
+				if err := write(websocket.TextMessage, []byte("PING")); err != nil {
+					return fmt.Errorf("polymarket: ping: %w", err)
+				}
 			}
-			ups, err := sd.apply(f.raw, f.recvAt)
+			ups, err := sd.apply(f.raw, f.recvAt, b.liveOf)
 			if err != nil {
 				return err
 			}
@@ -140,7 +162,11 @@ type wsMsg struct {
 
 // apply maps one message (an object or an array of them). It only reads the
 // seed, so it is safe to share between runs.
-func (sd *seed) apply(raw []byte, recvAt time.Time) ([]model.Update, error) {
+// liveFunc gives a game's current in-play flag; ok=false means unknown, so
+// the seed's flag is used.
+type liveFunc func(gameRef string) (live, ok bool)
+
+func (sd *seed) apply(raw []byte, recvAt time.Time, live liveFunc) ([]model.Update, error) {
 	if len(raw) == 0 || raw[0] == 'P' { // PONG
 		return nil, nil
 	}
@@ -164,20 +190,20 @@ func (sd *seed) apply(raw []byte, recvAt time.Time) ([]model.Update, error) {
 			// A book message is current state; its timestamp is the last
 			// change, possibly hours ago, so it is not a publish time.
 			bid, ask := bestOf(m.Bids, true), bestOf(m.Asks, false)
-			u, err := sd.update(m.AssetID, bid, ask, recvAt, time.Time{})
+			u, err := sd.update(m.AssetID, bid, ask, recvAt, time.Time{}, live)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, u...)
 		case "best_bid_ask":
-			u, err := sd.update(m.AssetID, num(m.BestBid), num(m.BestAsk), recvAt, bookTS)
+			u, err := sd.update(m.AssetID, num(m.BestBid), num(m.BestAsk), recvAt, bookTS, live)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, u...)
 		case "price_change":
 			for _, pc := range m.PriceChanges {
-				u, err := sd.update(pc.AssetID, num(pc.BestBid), num(pc.BestAsk), recvAt, bookTS)
+				u, err := sd.update(pc.AssetID, num(pc.BestBid), num(pc.BestAsk), recvAt, bookTS, live)
 				if err != nil {
 					return nil, err
 				}
@@ -188,7 +214,7 @@ func (sd *seed) apply(raw []byte, recvAt time.Time) ([]model.Update, error) {
 	return out, nil
 }
 
-func (sd *seed) update(asset string, bid, ask float64, recvAt, bookTS time.Time) ([]model.Update, error) {
+func (sd *seed) update(asset string, bid, ask float64, recvAt, bookTS time.Time, live liveFunc) ([]model.Update, error) {
 	t := sd.tokens[asset]
 	if t == nil {
 		return nil, fmt.Errorf("%w: unknown token %s", book.ErrResync, asset)
@@ -201,13 +227,19 @@ func (sd *seed) update(asset string, bid, ask float64, recvAt, bookTS time.Time)
 	if am == 0 || t.closed {
 		status = model.StatusSuspended
 	}
+	inPlay := t.live
+	if live != nil {
+		if v, ok := live(t.gameRef); ok {
+			inPlay = v
+		}
+	}
 	line := model.CopyLine(t.line)
 	if t.family == model.FamilyMoneyline {
 		line = nil
 	}
 	return []model.Update{{
 		Book: Name, GameRef: t.gameRef, Identity: t.identity, Line: line,
-		American: am, Decimal: dec, Status: status, InPlay: t.live,
+		American: am, Decimal: dec, Status: status, InPlay: inPlay,
 		BookTS: bookTS, RecvAt: recvAt, Source: model.SourceStream,
 	}}, nil
 }

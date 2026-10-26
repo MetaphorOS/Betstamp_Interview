@@ -22,6 +22,33 @@ type LatencyStats struct {
 	BookMaxms    float64 `json:"bookMaxms"`
 }
 
+// LatencySplit is a book's latency over all stream updates, and separately
+// for pregame and in-play quotes, which move at very different rates.
+type LatencySplit struct {
+	All     LatencyStats `json:"all"`
+	Pregame LatencyStats `json:"pregame"`
+	Live    LatencyStats `json:"live"`
+}
+
+type splitWindow struct{ all, pre, live *latencyWindow }
+
+func newSplitWindow() *splitWindow {
+	return &splitWindow{newLatencyWindow(latencyWindowSize), newLatencyWindow(latencyWindowSize), newLatencyWindow(latencyWindowSize)}
+}
+
+func (w *splitWindow) add(process time.Duration, recvAt, bookTS time.Time, inPlay bool) {
+	w.all.add(process, recvAt, bookTS)
+	if inPlay {
+		w.live.add(process, recvAt, bookTS)
+	} else {
+		w.pre.add(process, recvAt, bookTS)
+	}
+}
+
+func (w *splitWindow) stats() LatencySplit {
+	return LatencySplit{All: w.all.stats(), Pregame: w.pre.stats(), Live: w.live.stats()}
+}
+
 // latencyWindow is a fixed-size ring of the most recent samples.
 type latencyWindow struct {
 	process []float64

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -15,7 +16,7 @@ import (
 )
 
 const (
-	pingEvery     = 30 * time.Second
+	pingEvery     = 15 * time.Second
 	expireEvery   = 250 * time.Millisecond
 	clientVersion = "2643.4.1.10"
 )
@@ -59,8 +60,23 @@ func (b *bookImpl) Stream(ctx context.Context, seed *book.Snapshot, em book.Emit
 	// Closing the socket is how ctx cancellation unblocks ReadMessage.
 	stop := context.AfterFunc(ctx, func() { conn.Close() })
 	defer stop()
-	conn.SetPongHandler(func(string) error { em.Heartbeat(); return nil })
+	// Pings are timed: the pong's round trip is the socket's network latency.
+	var pingSent atomic.Int64
+	conn.SetPongHandler(func(string) error {
+		em.Heartbeat()
+		if sent := pingSent.Swap(0); sent != 0 {
+			em.Pong(time.Since(time.Unix(0, sent)))
+		}
+		return nil
+	})
+	sendPing := func() error {
+		return write(func() error {
+			pingSent.Store(time.Now().UnixNano())
+			return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
+		})
+	}
 
+	subscribeSent := time.Now()
 	for _, msg := range subscribeMessages(st.partials) {
 		raw, err := json.Marshal(msg)
 		if err != nil {
@@ -105,9 +121,7 @@ func (b *bookImpl) Stream(ctx context.Context, seed *book.Snapshot, em book.Emit
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-ping.C:
-			if err := write(func() error {
-				return conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(5*time.Second))
-			}); err != nil {
+			if err := sendPing(); err != nil {
 				return fmt.Errorf("draftkings: ping: %w", err)
 			}
 		case now := <-tick.C:
@@ -133,7 +147,11 @@ func (b *bookImpl) Stream(ctx context.Context, seed *book.Snapshot, em book.Emit
 			}
 			if res.ack && !connected {
 				connected = true
+				em.Handshake(f.recvAt.Sub(subscribeSent))
 				em.Connected()
+				if err := sendPing(); err != nil {
+					return fmt.Errorf("draftkings: ping: %w", err)
+				}
 			}
 			for _, u := range res.updates {
 				if err := em.Emit(ctx, u); err != nil {
