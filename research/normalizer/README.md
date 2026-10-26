@@ -1,5 +1,7 @@
 # Cross-book normalization framework (separate workstream)
 
+> Historical research prototype. The submitted application is in [app/](../../app/); see the [submission README](../../README.md) for current behavior. Status and limitations below describe this experiment.
+
 Status: **working reference prototype**, measured on real DraftKings and
 FanDuel captures. It is intentionally a separate module from the feed clients in
 `../go/`; it consumes raw payloads and does not depend on the transports.

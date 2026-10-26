@@ -1,6 +1,8 @@
 # Go port: DraftKings / FanDuel REST + WebSocket
 
-Working Go implementation of the JavaScript feed clients in the repository root.
+> Historical research prototype. The submitted application is in [app/](../../app/); see the [submission README](../../README.md) for current behavior. Status and limitations below describe this experiment.
+
+Working Go implementation of the JavaScript feed clients in the parent research directory.
 It was built and verified against the live Ontario endpoints on **2026-10-25**
 (approximately 11:17–11:25 America/Toronto).
 

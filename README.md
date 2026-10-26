@@ -935,5 +935,5 @@ app/
   Dockerfile, fly.toml, fly.probe.toml
 research/               the Oct 24–25 investigation: Node probes, Go research
                         clients and 3-hour soak harness, normalizer prototype,
-                        journal and reports (captures and outputs are not committed)
+                        indexed reports (captures and outputs are not committed)
 ```

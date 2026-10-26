@@ -12,3 +12,6 @@ node_modules/
 research/go/.gotmp/
 
 *.exe
+
+# Internal working notes retained locally.
+.local-notes/
