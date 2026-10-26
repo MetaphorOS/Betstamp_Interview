@@ -1,0 +1,16 @@
+node_modules/
+captures/
+out/
+work/
+
+# Go toolchain caches kept inside the workspace for this machine's sandbox.
+.gopath/
+.gomodcache/
+.gocache/
+.gotmp/
+go/.gotmp/
+go/oddsfeed.exe
+normalizer/normctl.exe
+
+app/.gotmp/
+*.exe

@@ -1,0 +1,23 @@
+{
+  "name": "sportsbook-feed-research",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Read-only sportsbook API and WebSocket discovery probes",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "snapshot:dk": "node --use-system-ca dk-http.cjs",
+    "compare:dk": "node --use-system-ca compare-dk.cjs",
+    "probe:dk": "node --use-system-ca probe-ws.cjs dk",
+    "probe:fd": "node --use-system-ca probe-ws.cjs fd --nfl",
+    "summarize": "node summarize.cjs",
+    "extract:nfl": "node extract-fd-nfl.cjs"
+  },
+  "optionalDependencies": {
+    "playwright": "^1.56.0"
+  },
+  "dependencies": {
+    "ws": "^8.22.0"
+  }
+}
