@@ -472,7 +472,9 @@ function healthCard(b) {
   const wsUp = !!h.connectedSince;
   const beatAge = h.lastBeatAt ? (serverNow() - h.lastBeatAt) / 1000 : null;
   const beatCls = beatAge == null ? "" : beatAge < 35 ? "ok" : beatAge < 90 ? "warn" : "bad";
-  const pollAge = h.lastPollAt ? (serverNow() - h.lastPollAt) / 1000 : null;
+  // A full refresh reads REST too (for Polymarket it is the only live read).
+  const restAt = Math.max(h.lastPollAt || 0, h.lastSnapshotAt || 0);
+  const pollAge = restAt ? (serverNow() - restAt) / 1000 : null;
   const lat = state.lat[b.name] || {};
   // Book -> screen needs the book's publish time; FanDuel frames have none.
   const noBookTime = b.name === "fanduel";
@@ -527,7 +529,7 @@ function healthCard(b) {
     <div class="hhead"><b>${esc(b.displayName)}</b><span class="pill ${st}">${st}</span></div>
     <div class="hrow"><span>WebSocket</span><span class="${wsUp ? "ok" : "bad"}">${wsUp ? `connected ${since(h.connectedSince)}` : "not connected"}${
       h.lastBeatAt ? ` · <span class="${beatCls}">heartbeat ${age(h.lastBeatAt)}</span>` : ""}</span></div>
-    <div class="hrow"><span>Polling</span><span>${h.polls ? `<span class="${pollAge != null && pollAge < 60 ? "ok" : "warn"}">last ok ${age(h.lastPollAt)}</span> · ` : ""}${h.polls || 0} ok · <span class="${h.pollErrors ? "bad" : ""}">${h.pollErrors || 0} failed</span></span></div>
+    <div class="hrow"><span>Polling</span><span>${restAt ? `<span class="${pollAge != null && pollAge < 90 ? "ok" : "warn"}">last REST ok ${age(restAt)}</span> · ` : ""}${h.polls || 0} ok · <span class="${h.pollErrors ? "bad" : ""}">${h.pollErrors || 0} failed</span></span></div>
     <div class="hrow"><span>Snapshots</span><span>${h.snapshots || 0} ok · <span class="${h.snapshotErrors ? "bad" : ""}">${h.snapshotErrors || 0} failed</span>${h.lastSnapshotAt ? ` · last ${age(h.lastSnapshotAt)}` : ""}</span></div>
     <div class="hrow"><span>Recovery</span><span><span class="${h.reconnects ? "warn" : ""}">${h.reconnects || 0} reconnects</span> · <span class="${h.resyncs ? "warn" : ""}">${h.resyncs || 0} resyncs</span></span></div>
     <div class="hrow"><span>Data</span><span>last ${age(h.lastDataAt)} · ${h.updates || 0} updates</span></div>

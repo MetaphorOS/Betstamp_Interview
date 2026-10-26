@@ -107,7 +107,8 @@ func (b *bookImpl) Descriptor() book.Descriptor {
 func (b *bookImpl) Tuning() book.Tuning {
 	// Resnapshot every minute: the main spread/total line moves during a game,
 	// and a new main line means new tokens, so the stream must resubscribe.
-	return book.Tuning{ReconcileEvery: time.Minute, ResnapshotEvery: time.Minute,
+	// No separate live poll: it reads the same Gamma endpoint as the refresh.
+	return book.Tuning{ReconcileEvery: 24 * time.Hour, ResnapshotEvery: time.Minute,
 		MinSnapshotGap: 30 * time.Second, MinPollGap: 30 * time.Second}
 }
 

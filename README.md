@@ -497,7 +497,7 @@ Every REST call is budgeted, and `Retry-After` is honoured on errors:
 | DraftKings | league snapshot (also its only "poll") | ≤ 1 per 15 s per league, shared between snapshot and poll; reconcile every 30 s, full refresh every 5 min |
 | FanDuel | discovery + in-play | ≤ 1 per 2 min |
 | FanDuel | SMP prices | ≤ 1 per 5 s (reconcile every 30 s; every 5 s only while push is down) |
-| Polymarket | Gamma events | ≤ 1 per 30 s (reconcile and structure refresh every minute) |
+| Polymarket | Gamma events | 1 per minute while live (the full refresh; no separate poll, since it would read the same endpoint); every 30 s as fallback while the socket is down |
 
 No 429 or rate-limit block was seen in any run (including the research
 harness's 3-hour soak: 0 REST errors).
