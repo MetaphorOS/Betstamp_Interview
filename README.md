@@ -379,6 +379,27 @@ An empty ask side (nothing to buy) or a crossed book suspends the price at once,
 so the last one stops competing; asks with no bids are still buyable and priced.
 Its socket requires the subscription to be the very first message.
 
+**Resubscribing is by design here, not something Polymarket requires.** The
+socket can stay open indefinitely. Every minute the full refresh rebuilds the
+list of tokens to follow; if it changed (a new game, or a different main line),
+the supervisor opens a new connection with the new list. That's the simplest
+correct approach given the subscription must be the first message. On Fly it
+happens about every 5 minutes. The cause is probably the main line flipping
+between two neighbouring lines as prices drift, but that hasn't been confirmed.
+
+Its costs:
+- About 0.2–1 s without the stream each time. Nothing is lost: Polymarket sends
+  every token's full order book on subscribe.
+- One extra Gamma read, the poll right after connecting.
+- A brief "degraded" flicker on Polymarket's health pill. It isn't counted as a
+  reconnect and doesn't remove Polymarket from best price.
+
+Two improvements weren't needed for this submission:
+- **Change the subscription on the open socket.** The market channel appears to
+  accept subscribe/unsubscribe messages; not tested.
+- **Make the main-line choice sticky:** switch only when another line is
+  clearly closer to 50/50, which would cut the churn whatever its cause.
+
 ### 4.4 Which feed sends what
 
 > "Some feeds send the full picture every time; others only send changes and expect you to track the rest: which is each book?"
@@ -808,7 +829,7 @@ Three reviews of `app/` were run on 2026-10-26: a first review (findings
 **#1–#10**), a follow-up on the watchdog fix (**R2-1–R2-3**), and an independent
 review (**F1–F16**). Every finding is listed below, with duplicates merged. The
 longer version, with the full reasoning for each finding, is in
-[`REVIEW_RESPONSE.md`](REVIEW_RESPONSE.md).
+[`CODE_REVIEW.md`](CODE_REVIEW.md).
 
 ### 14.1 How fixes were chosen
 
