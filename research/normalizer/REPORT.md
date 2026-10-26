@@ -116,8 +116,9 @@ Conclusions:
    A production normalizer should add an internal-consistency gate (moneyline
    favorite vs spread sign) and quarantine the inconsistent quote instead of
    presenting it as a competing price.
-6. **Alt differences are not price values.** Exact alt overlap is 0; the books
-   expose different periods/players, so there is no price to compare yet.
+6. **The initial NFL alt sample has no comparable overlap.** Those sampled
+   feeds expose different periods/players. This does not apply to the later NBA
+   event-level comparisons below, which include matched props and alternate lines.
 
 Priority order for the product: fix line/slate/period alignment first, then model
 margin/vig, then treat the small number of genuine probability gaps as real
@@ -327,8 +328,10 @@ runners by parsing the signed line from `runnerName`, and supports
 `ALTERNATE_HANDICAP(S)`, `ALTERNATE_TOTAL(_POINTS)`, quarter/half variants, and
 MGA `PLAYER_*_TOTAL_*` player props.
 
-This closes the FanDuel event-level discovery gap. Full player-prop comparison
-still needs the unified main+alt merge and player registry.
+This closes the FanDuel event-level discovery gap. The later all-game NBA
+section below reports comparisons using the expanded
+main+alt data. A robust player alias registry and settlement validation remain
+follow-up work.
 
 ## Polymarket
 
@@ -481,8 +484,6 @@ inventory than DK; use family/exact-line counts rather than the full FD board.
 
 ## De-vig and synchronized comparison
 
-## De-vig and synchronized comparison
-
 Added `normalizer/internal/price` and `capture-tri.ps1`.
 
 - Each two-outcome group is converted to implied probabilities and normalized
@@ -521,9 +522,11 @@ that the raw gap was mostly margin. The remaining total gap is a stale PM total
 3. **NBA's low aggregate is a board/slate issue.** DK had Christmas games; FD had
    suffix-named games. Conditional on the 7 shared games, identity is 100% and
    same-line is 81.0%, essentially identical to NFL.
-4. **Alt markets are far.** They normalize into facets, but the captured feeds
-   expose different periods and player sets; exact cross-book alt identity is 0.
-   Player identity, period alignment and settlement rules are prerequisites.
+4. **Alternate-market coverage depends on the sample.** The initial NFL
+   alt sample has zero comparable overlap because periods and players differ.
+   Later NBA event-level work matched 384 DK/FD player-prop quote sides at
+   exact lines, alongside alternate-line comparisons. Player aliases and
+   period/settlement validation still need broader coverage.
 5. **Unknown and dangling metrics are the operating system for 10–100 books.**
    All sampled types are now classified, but low-confidence futures stay
    non-comparable. Dangling DK selections remain a concrete resync signal.
@@ -533,7 +536,8 @@ that the raw gap was mostly margin. The remaining total gap is a stale PM total
 
 ## Recommended next steps
 
-1. Player and team registries with alias/override queues (unblocks props).
+1. Player and team registries with alias/override queues to harden the existing
+   prop comparisons and expand coverage beyond the sampled names.
 2. A line-grid/comparability policy: exact line now; half-point/hook alignment as
    an explicit optional model.
 3. Period and settlement rule packs before adding more books.
@@ -541,7 +545,7 @@ that the raw gap was mostly margin. The remaining total gap is a stale PM total
 5. Then onboard the next 8 books using the same adapter + rule-pack contract and
    track coverage/unknown/dangling per book.
 
-Reproduce with:
+Reproduce from `research/` with:
 
 ```powershell
 cd normalizer

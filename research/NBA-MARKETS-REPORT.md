@@ -106,8 +106,10 @@ Confirmed against the raw JSON:
 - Lakers–Jazz (`34888793`): alt spread market `2_86923924` has 80 selections;
   Lakers range −27.5 to +14.5; main −6.5 is absent. Alt total `3_86923924` has
   88 selections; range 215.5–259.5; main 237.5 is absent.
-- FanDuel main filter: 17 events / 51 markets / 102 selections. The unfiltered
-  board is 19 events / 255 markets, including futures.
+- The earlier sport-type-only FanDuel filter returned 17 events / 51 markets /
+  102 selections, including simulated basketball. Requiring real NBA competition
+  ID 10547864 reduces this to 7 games / 21 markets / 42 runners, as reported
+  above. The unfiltered board was 19 events / 255 markets, including futures.
 - FanDuel default event response: 8 markets, no alternate ladder; 17
   `attachmentsFullyLoaded:false` cards, including the alternate cards. Popular
   tab: 80 markets, with **118** `ALTERNATE_HANDICAPS` and **157**

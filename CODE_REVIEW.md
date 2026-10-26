@@ -27,8 +27,10 @@ A finding was fixed if it met at least one of these:
    or health.
 4. **I introduced it.** R2-1 came from my own watchdog fix.
 
-A fix also had to be small, contained, and provable with a test that **fails on
-the old code and passes on the new**. Every fix below has one.
+Fixes were kept small and checked against the failure they addressed. Backend
+behavior fixes have automated regression tests. Browser removal and replay
+fixes were checked manually in a browser, not by a committed automated browser
+suite. Display and comment corrections were inspected.
 
 A finding was left open if any of these held:
 
@@ -40,7 +42,7 @@ A finding was left open if any of these held:
 - It affects a feature that is off in production.
 - Fixing it would trade one risk for another, without a clear win.
 
-Open items are listed in README §13 so the submission doesn't overclaim.
+Open items are listed in README §14.4 (summarized in §13) so the submission doesn't overclaim.
 
 **Verification note.** Findings marked *(verified)* I confirmed in the code or
 with a failing test. The others I'm taking from the review's own description;
@@ -263,8 +265,9 @@ a long time. Latency is a headline deliverable of the brief.
 sleep, Wi-Fi switching, a mobile network.
 
 **Fix.** Frames the server sent more than 2 s earlier are applied to the board
-but not counted as latency. In a browser test, a 30-second-old frame added no
-sample and a fresh one added one.
+but not counted as latency. In a manual browser check, a 30-second-old frame
+added no sample and a fresh one added one. This age-based heuristic can also exclude
+genuinely delayed deliveries, so it does not provide uncensored tail latency.
 
 **Why fixed.** Corrupts a headline number. The fix is three lines.
 
@@ -280,8 +283,8 @@ new price **next to all the old ones**. Memory also grew with every game seen.
 does that around kickoff and suspensions.
 
 **Fix.** Removing a game deletes all its cells; an emptied cell is deleted;
-"does this game have prices" checks for actual entries. Tested in the browser:
-6 cells before, 0 after.
+"does this game have prices" checks for actual entries. Checked manually in
+the browser: 6 cells before, 0 after.
 
 **Why fixed.** Old prices shown as current.
 
@@ -343,7 +346,7 @@ games past the cap would be **removed** as if they'd ended.
 **Impact.** Polymarket games disappear from the board without any error.
 
 **When it matters.** I checked today: the NFL series returns **42** events, and
-the NBA series returns **94 of 100**. This is close to real; a busy NBA stretch
+the NBA series returns **94 of 100** (98 by that afternoon). This is close to real; a busy NBA stretch
 could cross it.
 
 **Why not yet.** It's not a wrong-price bug, and it wasn't in the agreed set. It
@@ -510,13 +513,13 @@ book above. With the current books, cleanup takes milliseconds.
 | **Book constructor errors ignored** | None today (they can't fail); a future validation could be dropped. | Open. Cleanup. |
 | **No `IdleTimeout`/`MaxHeaderBytes`; shutdown wait unbounded** | Idle non-SSE connections linger; a stuck book could hold SIGTERM until Fly kills it. | Open. Measured shutdown is 327 ms. |
 | **`static.go` comment says the UI comes "in a later step"** | Stale comment. | Open. Nit. |
-| **Coverage gaps**: `clocksync` and `cmd/` untested, no fuzz tests, no browser/E2E test, slow-client test uses a channel, not a real socket | Bugs in the page and in parsing are found later than they could be. | Partly addressed: every fix above added a regression test, and the page fixes were checked in a live browser. A browser test suite and decoder fuzzing are the next testing investments. |
+| **Coverage gaps**: `clocksync` and `cmd/` untested, no fuzz tests, no browser/E2E test, slow-client test uses a channel, not a real socket | Bugs in the page and in parsing are found later than they could be. | Partly addressed: backend behavior fixes added automated regression tests; page behavior fixes were checked manually in a browser, and display/comment corrections were inspected. A browser test suite and decoder fuzzing are the next testing investments. |
 
 ---
 
 ## What I'd do next, in order
 
-1. **F9** Polymarket paging: NBA is at 94/100 today.
+1. **F9** Polymarket paging: NBA is at 98/100 by the afternoon of 2026-10-26.
 2. **F13 + F14**: two one-line DraftKings guards.
 3. **F7** SSE write deadline, with a real slow-socket test.
 4. **F11** bundle-fetch backoff, and the **exit-code** one-liner.

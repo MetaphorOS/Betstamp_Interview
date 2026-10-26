@@ -7,8 +7,10 @@ It was built and verified against the live Ontario endpoints on **2026-10-25**
 (approximately 11:17–11:25 America/Toronto).
 
 This is a faithful port of the transport and parsing layer, not the production
-collector described in `README.md`. Reconnect/resync, subscription narrowing and
-browser fanout are still open, exactly as they were for the Node probes.
+collector described in the submission README. The finite probe commands are
+separate from the later `soak` harness, which
+adds reconnect/resync and snapshot-derived subscriptions. Browser fanout
+belongs to the submitted app, not this research module.
 
 ## What is ported
 
@@ -48,16 +50,17 @@ go/
 
 ## Build and test
 
-Run from `go/`. The cache paths below are required **on this machine** because
+From the repository root, enter `research/go/`. The cache paths below are
+required **on this machine** because
 the sandbox cannot write Go's default user-profile cache; on a normal checkout
 plain `go build` is enough.
 
 ```powershell
-cd go
+cd research/go
 $env:GOPATH     = 'D:\Projects\BitStamp_Interview\.gopath'
 $env:GOMODCACHE = 'D:\Projects\BitStamp_Interview\.gopath\pkg\mod'
 $env:GOCACHE    = 'D:\Projects\BitStamp_Interview\.gocache'
-$env:TMP        = 'D:\Projects\BitStamp_Interview\go\.gotmp'   # avoids a Windows test-binary cleanup race
+$env:TMP        = 'D:\Projects\BitStamp_Interview\research\go\.gotmp'   # avoids a Windows test-binary cleanup race
 $env:TEMP       = $env:TMP
 New-Item -ItemType Directory -Force $env:TMP | Out-Null
 go build -o oddsfeed.exe ./cmd/oddsfeed
@@ -66,10 +69,11 @@ go test ./...          # 18 unit tests, no network
 
 Only dependency: `github.com/gorilla/websocket v1.5.3`.
 
-Run the binary from the repository root so the default `captures/fd-main.js`
-bundle and `out/` directory resolve:
+Run the binary from `research/` so the default `captures/fd-main.js` bundle
+and `out/` directory resolve. After building in `research/go/`:
 
 ```powershell
+cd ..
 .\go\oddsfeed.exe verify -seconds 15
 ```
 
@@ -341,10 +345,10 @@ the same body as Node. This is a transport detail, not a credential change.
 - **Errors are returned.** A GraphQL `errors` response fails the call instead of
   yielding `undefined`; malformed frames are skipped and counted.
 - **No MessagePack.** JSON only, matching the transports actually tested.
-- **No reconnect loop.** Like the probes, these are finite observations. A
-  production collector still needs capped exponential backoff with jitter,
-  subscribe-and-buffer during bootstrap, a fresh snapshot on reconnect, and
-  stale-book marking.
+- **Finite probes versus soak.** The standalone `dk-ws` and `fd-ws` probes
+  make finite observations without reconnect loops. The `soak` command adds
+  capped backoff, reconnect/resnapshot and liveness monitoring as described
+  above; production board freshness and browser fanout live in `app/`.
 
 ## Unit tests
 

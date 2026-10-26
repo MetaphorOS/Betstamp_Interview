@@ -18,7 +18,8 @@ and total, pregame and in-play, for the NFL (required) and the NBA (extra).
 | Live at a public URL | https://betstamp-odds.fly.dev/ |
 | Keeps working when a book is down; stale data made obvious | Done: per-book health, greyed stale cells, ⚠ on old prices, poll fallback |
 | End-to-end latency per book, pregame and live | Measured per hop with error bounds ([§3](#3-speed-and-latency)); live game on Fly still to record |
-| One ingestion per book; many viewers; a third book without re-architecting | Done; Polymarket added by touching only its own package plus a 3-line registration |
+| One ingestion per book; many viewers; a third book without re-architecting | Done; Polymarket added by touching only its own package plus a 3-line registration (the page has since gained a few per-book labels, [§7.3](#73-a-third-book-without-re-architecting)) |
+| Code review | Three reviews; what was fixed, and what was left open and why ([§14](#14-code-review-what-was-found-and-what-was-done)) |
 | Best price across different lines | Rule defined and tested ([§5.4](#54-best-price-when-books-are-on-different-lines)) |
 
 ---
@@ -83,7 +84,7 @@ Settings (all optional):
 | `PM_IN_BEST=0` / `-pm-best=false` | on | keep Polymarket out of best price |
 | `NTP_SERVER` / `-ntp` | `time.google.com` | clock-offset source for latency correction |
 | `FD_AK` | read from FanDuel's JS | override FanDuel's public app key |
-| `FD_MAIN_JS` | none | a saved FanDuel bundle to fall back on if the live fetch fails |
+| `FD_MAIN_JS` / `-fd-bundle` | none | a saved FanDuel bundle to fall back on if the live fetch fails |
 | `DK_USER_AGENT` | Chrome 156 UA | override the UA DraftKings' edge requires |
 
 Other commands:
@@ -147,6 +148,26 @@ A book never sees another book, the board, or the browser. The board never
 knows which books exist: a test fails the build if the words `draftkings` or
 `fanduel` appear anywhere outside `internal/books/**` and `cmd/**`.
 
+### Goroutines
+
+| Goroutine | How many | Why it's separate |
+|---|---|---|
+| Supervisor loop | 1 per book | Owns the watchdog, reconnects and timers. It only ever waits on channels, never on the network ([§8.1](#a-bug-worth-telling-the-watchdog-stuck-behind-rest)). |
+| Stream | 1 per book | Runs the book's `Stream`: parses frames, sends pings, emits updates. Restarted by the supervisor on any failure. |
+| Socket reader | 1 per book | Blocks on the WebSocket read and hands frames to the stream goroutine, so a ping or shutdown is never stuck behind a read. |
+| Background REST job | 0–1 per book | A reconcile poll or a full refresh, one at a time, so a slow request can't hold up the supervisor loop. |
+| Health ticker | 1 per book | Recomputes the book's health every second. |
+| Board | 1 | The only owner of games, slots, best price and health, so there are no locks. Everything reaches it through a channel. |
+| Hub | 1 | Holds the one board subscription, encodes each delta once, keeps the resume ring. |
+| SSE client | 1 per viewer | The HTTP handler writing that viewer's stream; it reads from its own 512-message queue, so a slow viewer stalls only itself. |
+| NTP | 1 | Measures the clock offset every 60 s. |
+
+So with three books and N viewers there are about 15 long-lived goroutines,
+plus up to 3 short REST jobs, plus N. Books never share a goroutine: one book
+panicking, hanging or being blocked can't stall another, and there's a test for
+that. Every goroutine takes the process context, so Ctrl+C or SIGTERM stops
+them all (measured at 327 ms).
+
 **Data flow of one price change (DraftKings):** DK publishes a JSON delta on
 its WebSocket → the DK transport stamps `RecvAt` at the socket read and feeds
 it to the DK state machine → the state machine emits a `model.Update`
@@ -184,8 +205,16 @@ book publishes ──b2s──▶ our socket read ──process──▶ board a
   frames carry no timestamp**, so FanDuel's book→server and book→screen can't be
   measured directly (its card shows "—"); see [§3.4](#34-fanduel-without-a-publish-time).
 - Samples are split by the price's in-play flag into **pregame** and **live**.
-- Only prices pushed over the stream and that visibly changed count. Polls and
-  snapshots don't (their freshness shows as per-price age instead).
+- Only stream data counts; polls and snapshots don't (their freshness shows as
+  per-price age instead). The server times **every** stream update, including
+  ones that re-confirm an unchanged price. The page can only time what reaches
+  it: stream deltas that changed something.
+- The page excludes deltas encoded more than 2 s earlier as a replay heuristic.
+  This avoids counting a reconnect backlog as fresh delivery, but can also
+  exclude genuinely delayed deliveries; the displayed percentiles are not an
+  uncensored measure of tail latency.
+- Browser timing ends when the page handles the event, before DOM rendering
+  and paint. It does not measure the exact moment pixels appear on screen.
 - p50 / p95 over the last 300 samples per book per phase on the page, 4,096 on the server.
 
 ### 3.2 Clocks, and how much to trust the numbers
@@ -199,7 +228,9 @@ code. Two corrections:
    The offset is a record (value, error, measured-at, valid). It's **invalid**
    if never measured or older than 2 minutes, and while it's invalid the page
    records no corrected samples and says "uncorrected: server clock unknown".
-   Unknown is never treated as zero.
+   Unknown is never treated as zero. Samples recorded before it went invalid
+   stay in the window; on Fly the clock has never gone invalid (offset steady
+   at ~2 ms).
 2. **Browser clock vs server.** The page times `/api/ping` round trips and
    assumes the server stamped its time at the midpoint (Cristian's method),
    keeping the lowest-round-trip sample of the last 30. Error is at most half
@@ -233,6 +264,18 @@ All requests from Ontario. Pregame unless stated. n = sample count.
 `subscribed`, FD `connection_init` → `connection_ack`, PM `PING` → `PONG` once
 subscribed): the same measure for every book. SSE encoding averaged 17 µs per delta.
 
+**On Fly, a longer window: 8 hours, 2026-10-26 06:20–14:45Z** (overnight into
+Monday morning, all pregame; NTP offset +1.5 ms applied):
+
+| Book | book→server p50 / p95 / max | processing p50 / p95 | n |
+|---|---|---|---|
+| DraftKings | **18.7 / 28.8 / 202 ms** | 195 / 378 µs | 822 |
+| FanDuel | not measurable | 145 / 216 µs | 322 |
+| Polymarket | **52.0 / 69.0 / 231 ms** | 104 / 211 µs | 4,096 (last of more) |
+
+These agree with the short window above, with a far bigger DK sample. SSE
+encoding averaged 34 µs per delta over 64,270 deltas.
+
 **Fly → a browser at home (Ontario), the full book→screen, same morning:**
 
 | Book | book→screen p50 / p95 | server→you p50 | bound |
@@ -252,13 +295,13 @@ with `boardctl` on the home PC, with one NTP correction taken at startup (good t
 | Polymarket | 41.4 / 71.7 ms (n=4,096) | mixed live/pregame |
 
 **Still to record:** a live NFL game measured on Fly with the current per-phase
-method (Monday Night Football is the next one). The page's **live** rows fill in
+method: no NFL game was played between deploying to Fly and the deadline. The page's **live** rows fill in
 automatically during a game.
 
 ### 3.4 FanDuel without a publish time
 
-FanDuel's AppSync frames have no timestamp, so book→screen is unmeasurable from
-the outside. What we have:
+The captured FanDuel AppSync frames have no publish timestamp, so absolute
+publish-to-browser latency cannot be derived from that feed alone. What we have:
 
 - **Push vs polling, timed in one process** (2 min, 18 live markets, FanDuel's own
   5 s SMP polling): the socket delivered the change first on **76 of 76**
@@ -271,8 +314,10 @@ the outside. What we have:
   while its handshake is 55 ms and TCP connect is 4–9 ms. This does not delay
   price frames.
 
-A fair estimate would compare arrival times when DK and FD move the same line
-(FD's lag relative to DK, whose latency is known). That's on the next-steps list.
+Comparing arrival times when DK and FD move the same line would measure
+relative cross-book movement timing, not FanDuel's absolute delivery latency:
+the books may decide to reprice at different times. That's on the next-steps
+list as a separate comparison, alongside receive-to-browser measurements.
 
 ### 3.5 What keeps latency down, and why each choice
 
@@ -281,9 +326,9 @@ A fair estimate would compare arrival times when DK and FD move the same line
 | **Push, not polling, for prices** on all three books | Polling adds on average half its interval (2.5 s at 5 s) before you even see a change. Measured: FD's socket beat its own 5 s poll by 1.8 s median; DK's socket beat 1 s polling on 5 of 6 live changes by ~2.2 s. |
 | **Deltas, not snapshots, on the hot path** | DK sends only what changed; we apply it in place. Snapshots (REST) are for structure, startup, and reconcile, never on the price path. |
 | **Socket read time stamped once, at the read** | Every hop is measured from the same instant; nothing in our pipeline hides inside "book latency". |
-| **Single-goroutine board, in memory** | No locks, no database, no queue between ingest and fanout. Processing is ~100–180 µs at p50 on Linux (p95 under 0.3 ms for DK and FD). |
-| **No batching** | Each delta goes to browsers the moment the board applies it. The only coalescing is "if several are already queued for a client, write them, then flush once", which never adds a wait. The page batches DOM work into the next animation frame (≤16 ms). |
-| **Encode once** | The hub turns each delta into SSE bytes once and copies the same bytes to every viewer. 17 µs per delta regardless of viewer count. |
+| **Single-goroutine board, in memory** | Single-owner board state, no database and no external message broker; buffered Go channels connect ingestion, the board and fanout. Processing is ~100–200 µs at p50 on Linux, p95 under 0.4 ms (8-hour run). |
+| **No batching** | Each delta goes to browsers the moment the board applies it. The only coalescing is "if several are already queued for a client, write them, then flush once", which never adds a wait. The page batches DOM work into the next animation frame; this often adds about one display frame, but is not bounded to 16 ms under load or in a background tab. |
+| **Encode once** | The hub turns each delta into SSE bytes once and copies the same bytes to every viewer. 17–34 µs per delta on average (two runs) regardless of viewer count. |
 | **Small payloads** | A delta is one slot for one book: ~330 bytes of JSON with short keys and epoch-ms times. Full board on connect: 141 KB raw (82 games, 330 slots), 23 KB gzipped by Fly's edge on `/api/board`. |
 | **SSE, not WebSocket, to browsers** | Traffic is one-way. SSE is plain HTTP: it works through proxies and CDNs, the browser reconnects by itself, and `Last-Event-ID` gives resume for free. The browser→server direction (clock pings) is a tiny `GET`. |
 | **Hosting in Toronto (Fly `yyz`)** | Inside Ontario for the region-locked books, and close to them: handshake round trips from Fly were DK 41 ms, FD 55 ms, PM 103 ms. |
@@ -335,8 +380,9 @@ raced push against polling in the same process.
 - **Result on a full captured hour spanning the 1 p.m. kickoff: 6,849 update
   frames, 0 resyncs**, 618 line moves, 7 kickoffs all ending in-play, and
   exactly 78 removals, all for the 13 next-week games DK pulled at 1 p.m.
-- **DK closes the socket every ~30 min** (code 1006). The supervisor reconnects
-  (1–2 s) from a fresh snapshot; DK has `initialData:false`, so a reconcile 2 s
+- **DK closes the socket every ~30 min** (code 1006; 16 times in 8 hours on
+  Fly). The supervisor reconnects in about 0.5–2 s, from a fresh snapshot or,
+  inside DK's 15 s REST limit, the last one; DK has `initialData:false`, so a reconcile 2 s
   after each connect covers anything missed between snapshot and subscribe.
 
 ### 4.2 FanDuel (Ontario)
@@ -388,8 +434,9 @@ happens about every 5 minutes. The cause is probably the main line flipping
 between two neighbouring lines as prices drift, but that hasn't been confirmed.
 
 Its costs:
-- About 0.2–1 s without the stream each time. Nothing is lost: Polymarket sends
-  every token's full order book on subscribe.
+- About 0.2–1 s without the stream each time. Polymarket sends every subscribed
+  token's full order book to restore current state, but intermediate price
+  movements during the gap can be missed.
 - One extra Gamma read, the poll right after connecting.
 - A brief "degraded" flicker on Polymarket's health pill. It isn't counted as a
   reconnect and doesn't remove Polymarket from best price.
@@ -668,7 +715,7 @@ should only ever wait on channels, never on I/O.
 - **⚠ on any price not confirmed for 3 minutes.** "Confirmed" means a stream frame,
   poll or snapshot saw that price, changed or not; the server sends these
   confirmations every 5 s. Healthy feeds confirm every 30–60 s, so ⚠ means a
-  feed has gone quiet. (The full REST refresh is every 5 min, so 3 min fires first.)
+  feed has gone quiet. (DK's full REST refresh is every 5 min, so 3 min fires first.)
 - Every price shows its age ("DK · 12s ago").
 - The page's own connection: live/reconnecting, reconnect count, and a watchdog
   that reconnects if nothing arrives for 35 s (the server pings every 15 s).
@@ -700,7 +747,7 @@ One page, plain JavaScript, embedded in the binary.
   and **red** when worse, with ▲/▼ and the previous price struck through for
   60 s. Switching views never flashes.
 - **Per-book health card:** WebSocket (connected for, last heartbeat), polling
-  (last ok, counts, last error), snapshots, reconnects and resyncs, data age,
+  (last REST read, poll or full refresh; counts; last error), snapshots, reconnects and resyncs, data age,
   **Latency** (book→screen p50 ± bound, p95, n) with **pregame** and **live**
   below it and the hops, **Handshake**, and **Ping**.
 - **Top bar:** connection state, `Seq`, reconnects, browser↔server ping, both clock errors.
@@ -727,7 +774,7 @@ One page, plain JavaScript, embedded in the binary.
 | Polymarket | parse real Gamma events, mirrored spread sides, ask-priced stream messages, **empty ask side suspends, ask-only priced, crossed suspends**, live flag follows the latest snapshot |
 | Fanout | snapshot then deltas with no gap, resume, too-old resume gets a snapshot, slow client dropped, ping, clock validity |
 | FanDuel | app key extracted from the real bundle, simulated key rotation recovers, esports refused, NBA competition filter |
-| Extensibility | no book names outside `internal/books` and `cmd` |
+| Extensibility | the names `draftkings` and `fanduel` appear nowhere outside `internal/books` and `cmd` |
 
 Live checks are in `boardctl` (headless run with recovery tests) and `probe`
 (reachability from any machine).
@@ -743,6 +790,11 @@ Live checks are in `boardctl` (headless run with recovery tests) and `probe`
 - Before deploying, `cmd/probe` was run on Fly to check each book's snapshot and
   stream from Fly's network (`app/fly.probe.toml`).
 - Shutdown on SIGTERM measured at 327 ms.
+- Deploy: `fly deploy` from `app/`. (`--local-only` builds with local Docker;
+  it was needed here because Fly's remote builder failed TLS from the
+  development PC's network.)
+- Observed over its first 8 hours: 0 REST errors on any book; DK's socket
+  closed 16 times, FanDuel's twice, and each came back in about a second.
 - Cost: about $3.69/month for the machine plus $3.60/month for the static IP.
 
 ---
@@ -751,18 +803,33 @@ Live checks are in `boardctl` (headless run with recovery tests) and `probe`
 
 ### Next, with more time
 
-1. Record **live** book→screen per book on Fly through a full NFL game, and keep
-   a long run (hours) to catch slow failures.
-2. **Estimate FanDuel's latency** from cross-book moves: when DK and FD move the
-   same line, FD's arrival lag relative to DK.
-3. **Props and alternate lines.** The research already maps the endpoints:
+1. Record **live** book→screen per book on Fly through a full NFL game (an
+   8-hour pregame run is done, [§3.3](#33-measured)).
+2. **Polymarket discovery paging:** it reads one page of 100 events per
+   league, and NBA was at 98. Then the other open review items, in the order
+   in [§14.4](#144-left-open).
+3. **Measure relative DK/FD movement timing** when both books move the same
+   line, separately from receive-to-browser latency. This comparison includes
+   differences in when the books reprice and cannot establish FanDuel's
+   absolute publish-to-browser latency.
+4. **Props and alternate lines.** The research already maps the endpoints:
    DK alternate/prop subcategories, FanDuel's event-page "Popular" tab and MGA
    market search, both books' sockets carrying them (verified). Needs a player
    registry and period/settlement rules (DK lists 1st-half props where FD lists
    full-game).
-4. An internal-consistency gate: quarantine a book's line when its moneyline
+5. An internal-consistency gate: quarantine a book's line when its moneyline
    favorite contradicts its spread sign (seen once in DK data).
-5. DK's `msgpack` format (smaller frames), and a short history store for line charts.
+6. DK's `msgpack` format (smaller frames), and a short history store for line charts.
+7. **A viewer load test**, to replace the estimates in "What breaks first at
+   scale" with measurements. The plan:
+   - Point 500, then 2,000, then 5,000 simulated SSE clients at a staging copy
+     (a small Go program, one goroutine per client).
+   - Measure server→viewer delay, CPU, memory and dropped clients, and whether
+     a slow viewer affects the others.
+   - Then restart the server under load to measure the reconnect storm: time
+     until every client is back, and the bytes sent.
+   - Repeat with a few clients that stop reading, to size the SSE write-deadline
+     fix (review F7).
 
 ### What changes for a third book, or ten
 
@@ -771,18 +838,64 @@ one `Register` line. What has to grow for ten:
 
 - **Adapters stay small, the shared parts stay shared.** Reconnects, backoff,
   rate limits, health, matching, best price and fanout are already written once.
-- **Golden replay tests per book.** Every book here is tested by replaying an
-  hour of its real traffic. That's the onboarding gate: capture, replay, prove 0
-  resyncs and full parity before it goes live.
+- **Replay coverage per book.** DraftKings and FanDuel have hour-long captured
+  traffic replays. Polymarket has real snapshot fixtures and targeted stream
+  message tests, not an equivalent hour-long replay. For new adapters, the
+  intended onboarding gate is captured-traffic replay with checked coverage,
+  reconciliation and resync behavior; extend Polymarket coverage to that bar.
 - **Registries, not code:** team aliases, competition IDs (to keep out esports
   and simulations), market-type tables and period rules become data.
-- **Scale-out:** the board is one goroutine; at ~10 books it's still nowhere near
-  its limit (processing is sub-millisecond). Beyond that, partition boards by
-  league, and put a pub/sub relay between ingest and fanout so viewer servers
-  scale separately from ingestion.
+- **Scale-out:** current processing timings suggest headroom for more books,
+  but capacity at ten books is an estimate pending load testing with realistic
+  update rates. If board throughput becomes limiting, partition by league;
+  a pub/sub relay would let viewer servers scale separately from ingestion.
 - **Per-book network identity:** some books block datacenter ranges, so a static
   outgoing IP per region (or a residential collector feeding the cloud relay) is
   part of onboarding.
+
+### What breaks first at scale
+
+The deployment is one 512 MB machine in Toronto, with a few viewers and about
+100 games. This is where it would break as each dimension grows, in the order I
+expect. Numbers come from the running Fly app (2026-10-26) unless they're
+marked as **estimates**. No load test has been run yet (it is item 7 in "Next, with more time" above).
+
+**More viewers**
+
+| What breaks | Why | How you'd see it | Fix |
+|---|---|---|---|
+| **Reconnect storms** (first to hurt) | A deploy or restart drops every viewer at once. The resume ring lives in memory, so after a restart nobody can resume and everyone needs a full snapshot: 167 KB uncompressed today (96 games, 358 slots). Estimate: 1,000 viewers means ~170 MB leaving one machine in a few seconds. | `odds_sse_resyncs_total` and `odds_sse_bytes_total` jump; CPU and egress spike after each deploy. | Compress the snapshot (16 KB gzipped); spread reconnects with a jittered `retry:`; keep the ring outside the process; run 2+ instances so a deploy rolls. |
+| **Clients that stop reading** | SSE writes have no deadline (review F7), so a stuck client holds its goroutine and socket until TCP gives up. A few KB each now; thousands of mobile clients make it real. | Goroutines and open sockets grow while `clients` stays flat. | A per-write deadline; drop on a failed flush. |
+| **Bandwidth** | Every delta goes to every viewer. Pregame averaged ~2.2 deltas/s (68,869 in 8.8 h); live games are much busier. At ~330 bytes a delta that's under 1 KB/s per viewer pregame. **Estimate:** a busy Sunday could be 10–50×. | `odds_sse_bytes_total`; Fly egress; `odds_sse_dropped_clients_total`. | Per-viewer filters (league, game) so a viewer only gets what it shows; then a relay tier (below). |
+| **One machine, one region** | No failover; viewers far from Toronto pay the round trip on every delta. | Downtime on deploys; server→you latency by region. | Stateless viewer servers in several regions behind a pub/sub relay; ingestion stays in Ontario. |
+
+**More books (10)**
+
+| What breaks | Why | Fix |
+|---|---|---|
+| **Network identity, not CPU** | Blocks by IP range, region locks and per-book rate limits; Fly's shared IPs were already blocked once. | A known outgoing IP per book and region, and per-book budgets as config. |
+| Board throughput (unverified at ten books) | Current processing is ~0.2 ms per update. Headroom is expected, but per-book update rates, bursts and queueing determine capacity. | Load-test realistic traffic and queue delay; partition boards by league if measured throughput requires it. |
+| Onboarding and upkeep | Each book needs adapters, team and market tables, and replay tests; layouts change without notice. | The registries-as-data and replay gate above; drift alerts. |
+
+**More markets (props and alternates: 10–100× the slots)**
+
+| What breaks | Why | Fix |
+|---|---|---|
+| Snapshot size and page rendering | Both grow with every slot; the page re-scans all slots on a full render. | Load a game's markets on demand; index slots per game in the page. |
+| Resume window | The ring holds 8,192 deltas: about an hour at today's pregame rate, but only minutes at a busy live rate, so more viewers miss it and need a snapshot. | Size the ring by time, not count; keep it outside the process. |
+| Memory over weeks | Finished games are never pruned from the board and matcher (review F16). | A shared retention rule. |
+
+**Upstream caps.** Polymarket's discovery reads one page of 100 events per
+league, and NBA was at 98 (review F9). It's a scale limit that's about to bite
+already.
+
+The design choices that make this manageable are already in place:
+- one ingestion per book, whatever the number of viewers;
+- deltas encoded once;
+- a strict boundary between ingestion and fanout.
+
+That boundary means the viewer side can be split off into its own tier without
+touching the books.
 
 ### Where AI or other tooling helps
 
@@ -814,12 +927,10 @@ one `Register` line. What has to grow for ten:
   games and Polymarket's in-play flag going stale on stream updates (both found
   in live data), and the supervisor's watchdog stuck behind slow REST calls
   (found in code review; [§8.1](#a-bug-worth-telling-the-watchdog-stuck-behind-rest)).
-  Earlier progress notes that cited those esports games as real are corrected
-  in `app/PROGRESS.md`.
 - **Code-review findings** that are fixed, and those deliberately left open, are
   covered in [§14](#14-code-review-what-was-found-and-what-was-done). The
   open item closest to biting is Polymarket's 100-event discovery cap (NBA
-  returned 94 events on 2026-10-26).
+  went from 94 to 98 events during 2026-10-26).
 
 ---
 
@@ -841,8 +952,10 @@ A finding was **fixed** if it met at least one of these:
 3. It corrupts a number this README reports (latency or health).
 4. I introduced it.
 
-The fix also had to be small, and provable with a test that **fails on the old
-code and passes on the new**. Every fix below has one.
+Fixes were kept small and checked against the failure they addressed. Backend
+behavior fixes have automated regression tests. Browser removal and replay
+fixes were checked manually in a browser; those checks are not a committed
+automated browser suite. Display and comment corrections were inspected.
 
 A finding was **left open** if any of these held:
 
@@ -880,7 +993,7 @@ A finding was **left open** if any of these held:
 
 | Finding | Impact | When it would bite | Why open |
 |---|---|---|---|
-| **F9 / #8** Polymarket discovery reads one page of 100 events | Games past 100 silently missing, and **removed** as if they'd ended. | NFL returned 42 events on 2026-10-26 but **NBA returned 94**: a busy stretch crosses it. | Not a wrong-price bug and wasn't in this round. **The next fix**: paging is small. |
+| **F9 / #8** Polymarket discovery reads one page of 100 events | Games past 100 silently missing, and **removed** as if they'd ended. | NFL returned 42 events on 2026-10-26 but **NBA returned 94, then 98 later that day**: a busy stretch crosses it. | Not a wrong-price bug and wasn't in this round. **The next fix**: paging is small. |
 | **R2-3** Backoff polls cut off by a short reconnect deadline | A cancelled poll still uses its rate-limit window, so there are gaps with neither stream nor polling. | A socket failing repeatedly in the first backoff steps while REST works. | A trade-off: letting polls outlive the wait brings back the watchdog bug. Self-limiting within seconds. Fix: skip a poll that can't finish in the time left. |
 | **#5 / F7** SSE writes have no deadline | A client that stops reading holds a goroutine and connection until TCP gives up. Other viewers are **not** slowed. | Many broken clients, or abuse. | A few KB per stuck client at this scale; the fix needs a real slow-socket test. |
 | **F11** FanDuel bundle fetch retried every snapshot after a failure | Slower FanDuel snapshots and a warning every 2 min; prices still flow with the last keys. | Only while FanDuel's homepage is blocked (seen once, on a bad Fly IP). | Already-degraded mode with a working answer. |
@@ -920,9 +1033,10 @@ A finding was **left open** if any of these held:
 - **Test coverage**
   - `clocksync` and `cmd/` are untested; there are no fuzz tests and no browser
     tests.
-  - Every fix in 14.2 added a regression test, and the page fixes were checked
-    in a live browser. Browser tests and decoder fuzzing are the next testing
-    investment.
+  - Backend behavior fixes in 14.2 added automated regression tests; page
+    behavior fixes were checked manually in a live browser. Display and
+    comment corrections were inspected. Automated browser tests and decoder
+    fuzzing are the next testing investment.
 
 **Next, in order:**
 
@@ -937,6 +1051,8 @@ A finding was **left open** if any of these held:
 ## 15. Repository layout
 
 ```
+README.md               this file
+CODE_REVIEW.md          every code-review finding, its impact, and what was done
 app/
   cmd/server/           the service + embedded page (web/)
   cmd/boardctl/         headless runner: prints deltas, latency summary, kill tests
@@ -950,9 +1066,9 @@ app/
   internal/teams/       NFL + NBA team registry
   internal/match/       cross-book game matching
   internal/clocksync/   SNTP offset
+  internal/taxonomy/    book-neutral market-text helpers
   internal/archtest/    the "no book names outside books" guard
   testdata/             trimmed real captures used by the replay tests
-  PROGRESS.md           detailed build log with every measured number
   Dockerfile, fly.toml, fly.probe.toml
 research/               the Oct 24–25 investigation: Node probes, Go research
                         clients and 3-hour soak harness, normalizer prototype,

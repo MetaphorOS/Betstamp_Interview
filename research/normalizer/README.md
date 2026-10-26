@@ -20,10 +20,13 @@ FanDuel captures. It is intentionally a separate module from the feed clients in
 
 ## Run it
 
+Run the following from `research/`; command paths and capture/output paths
+below are relative to that directory unless stated otherwise.
+
 ```powershell
 cd normalizer
 $env:GOCACHE = 'D:\Projects\BitStamp_Interview\.gocache'
-$env:TMP     = 'D:\Projects\BitStamp_Interview\go\.gotmp'
+$env:TMP     = 'D:\Projects\BitStamp_Interview\research\go\.gotmp'
 $env:TEMP    = $env:TMP
 go build -o normctl.exe ./cmd/normctl
 
@@ -344,6 +347,7 @@ with identical quote keys, and alt quotes being normalized but non-comparable.
   but there is no date-window route to force next week.
 - FanDuel NBA props are **not** on the league page; they come from the MGA
   event-market feed plus SMP prices. That feed is captured for Pistons @ 76ers
-  and compared in [REPORT.md](REPORT.md). It is not yet wired into the Go
-  normalizer as a first-class adapter.
+  and compared in [REPORT.md](REPORT.md). The event-level payload is now handled
+  by the existing Go FD adapter, as described above. Broader player aliases and settlement validation remain
+  limitations.
 - Specials are intentionally not comparable.
