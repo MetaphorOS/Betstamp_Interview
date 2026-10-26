@@ -26,18 +26,27 @@ import (
 )
 
 const (
-	Name       = "draftkings"
-	DefaultURL = "https://sportsbook-nash.draftkings.com/api/sportscontent/dkcaon/v1/leagues/88808"
+	Name      = "draftkings"
+	LeagueURL = "https://sportsbook-nash.draftkings.com/api/sportscontent/dkcaon/v1/leagues/"
 	// DefaultUA must look like a current Chrome: Akamai returns 403 for Go's
 	// default UA, an older Chrome UA, or no headers at all.
 	DefaultUA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 	DefaultWSURL = "wss://sportsbook-ws-ca-on.draftkings.com/websocket?format=json&locale=en-US"
 )
 
+// League is one DK league whose game-lines snapshot and partials we read.
+type League struct {
+	Sport string // canonical sport, also the team registry
+	ID    string // DK leagueId
+}
+
+// DefaultLeagues: NFL and NBA game lines.
+var DefaultLeagues = []League{{Sport: "nfl", ID: "88808"}, {Sport: "nba", ID: "42648"}}
+
 // Config is owned by this book package, not by the framework.
 type Config struct {
-	URL       string
-	Path      string // read the snapshot from a file instead of the network (tests)
+	Leagues   []League
+	Path      string // read one NFL snapshot from a file instead of the network (tests)
 	WSURL     string
 	Timeout   time.Duration
 	UserAgent string // DK_USER_AGENT overrides the default
@@ -51,13 +60,14 @@ type bookImpl struct {
 	lastRead time.Time // Snapshot and Poll share one REST endpoint and one budget
 }
 
-// restGap is the DK REST budget: one read per 15 s across Snapshot and Poll.
+// restGap is the DK REST budget: one read per league per 15 s across
+// Snapshot and Poll.
 const restGap = 15 * time.Second
 
 // New constructs the book.
 func New(cfg Config) (book.Book, error) {
-	if cfg.URL == "" && cfg.Path == "" {
-		cfg.URL = DefaultURL
+	if len(cfg.Leagues) == 0 {
+		cfg.Leagues = DefaultLeagues
 	}
 	if cfg.WSURL == "" {
 		cfg.WSURL = DefaultWSURL
@@ -88,14 +98,33 @@ func (b *bookImpl) Tuning() book.Tuning {
 	}
 }
 
-// Snapshot fetches structure and current prices.
+// Snapshot fetches structure and current prices for every league. All
+// leagues must succeed: a missing league would look like its games ended.
 func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 	asOf := time.Now()
-	raw, err := b.read(ctx)
-	if err != nil {
-		return nil, err
+	if b.cfg.Path != "" {
+		raw, err := os.ReadFile(b.cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		return ParseSnapshot(raw, asOf)
 	}
-	return ParseSnapshot(raw, asOf)
+	b.mu.Lock()
+	b.lastRead = time.Now()
+	b.mu.Unlock()
+	docs := make([]leagueDoc, 0, len(b.cfg.Leagues))
+	for _, l := range b.cfg.Leagues {
+		raw, err := b.read(ctx, LeagueURL+l.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", l.Sport, err)
+		}
+		var doc dkDoc
+		if err := json.Unmarshal(raw, &doc); err != nil {
+			return nil, fmt.Errorf("draftkings: decode %s snapshot: %w", l.Sport, err)
+		}
+		docs = append(docs, leagueDoc{league: l, doc: doc})
+	}
+	return buildSnapshot(asOf, docs...)
 }
 
 // Poll re-reads the snapshot and returns its quotes as poll updates. DK has no
@@ -120,14 +149,8 @@ func (b *bookImpl) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, 
 	return out, nil
 }
 
-func (b *bookImpl) read(ctx context.Context) ([]byte, error) {
-	if b.cfg.Path != "" {
-		return os.ReadFile(b.cfg.Path)
-	}
-	b.mu.Lock()
-	b.lastRead = time.Now()
-	b.mu.Unlock()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.URL, nil)
+func (b *bookImpl) read(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -160,22 +183,51 @@ func (e *HTTPError) RetryAfterDuration() time.Duration {
 	return 0
 }
 
-// ParseSnapshot builds the snapshot and the stream seed from a REST body.
+// ParseSnapshot builds the snapshot and the stream seed from an NFL body.
 func ParseSnapshot(raw []byte, asOf time.Time) (*book.Snapshot, error) {
+	return ParseLeagueSnapshot(raw, DefaultLeagues[0], asOf)
+}
+
+// ParseLeagueSnapshot builds a snapshot from one league's REST body.
+func ParseLeagueSnapshot(raw []byte, l League, asOf time.Time) (*book.Snapshot, error) {
 	var doc dkDoc
 	if err := json.Unmarshal(raw, &doc); err != nil {
 		return nil, fmt.Errorf("draftkings: decode snapshot: %w", err)
 	}
-	return buildSnapshot(doc, asOf)
+	return buildSnapshot(asOf, leagueDoc{league: l, doc: doc})
 }
 
-func buildSnapshot(doc dkDoc, asOf time.Time) (*book.Snapshot, error) {
+type leagueDoc struct {
+	league League
+	doc    dkDoc
+}
+
+func buildSnapshot(asOf time.Time, docs ...leagueDoc) (*book.Snapshot, error) {
 	skipped := map[string]int{}
 	sd := newState()
+	var games []model.BookGame
+	var quotes []model.Quote
+	var partials []map[string]any
+	for _, ld := range docs {
+		sd.leagueSport[ld.league.ID] = ld.league.Sport
+		g, q := addLeague(sd, ld.league.Sport, ld.doc, skipped)
+		games = append(games, g...)
+		quotes = append(quotes, q...)
+		partials = append(partials, entityPartials(ld.doc.SubscriptionPartials)...)
+	}
+	sd.partials = partials
+	return &book.Snapshot{
+		Games: games, Quotes: quotes, AsOf: asOf, Skipped: skipped,
+		Subscription: subscriptionKey(sd.partials),
+		Private:      sd,
+	}, nil
+}
+
+func addLeague(sd *state, sport string, doc dkDoc, skipped map[string]int) ([]model.BookGame, []model.Quote) {
 	events := map[string]dkEvent{}
 	games := make([]model.BookGame, 0, len(doc.Events))
 	for _, e := range doc.Events {
-		home, away, ok := resolveTeams(e.Participants)
+		home, away, ok := resolveTeams(sport, e.Participants)
 		if !ok {
 			skipped["unknown_team"]++
 			sd.ignoredEvents[e.ID.String()] = true
@@ -189,12 +241,12 @@ func buildSnapshot(doc dkDoc, asOf time.Time) (*book.Snapshot, error) {
 		}
 		live := isLive(e.Status)
 		g := model.BookGame{
-			Book: Name, BookGameID: e.ID.String(), Sport: "nfl", League: "nfl",
+			Book: Name, BookGameID: e.ID.String(), Sport: sport, League: sport,
 			Name: e.Name, Start: start.UTC(), Away: away, Home: home, Live: live, Status: e.Status,
 		}
-		e.homeID, e.awayID = home.ID, away.ID
+		e.homeID, e.awayID, e.sport = home.ID, away.ID, sport
 		events[g.BookGameID] = e
-		sd.events[g.BookGameID] = &evState{homeID: home.ID, awayID: away.ID, live: live}
+		sd.events[g.BookGameID] = &evState{homeID: home.ID, awayID: away.ID, live: live, sport: sport}
 		games = append(games, g)
 	}
 
@@ -253,12 +305,7 @@ func buildSnapshot(doc dkDoc, asOf time.Time) (*book.Snapshot, error) {
 		}
 		sd.owner[key] = q.BookSelectionKey
 	}
-	sd.partials = entityPartials(doc.SubscriptionPartials)
-	return &book.Snapshot{
-		Games: games, Quotes: quotes, AsOf: asOf, Skipped: skipped,
-		Subscription: subscriptionKey(sd.partials),
-		Private:      sd,
-	}, nil
+	return games, quotes
 }
 
 // entityPartials keeps only the "events" partials. The content-card partials
@@ -284,7 +331,7 @@ func subscriptionKey(partials []map[string]any) string {
 	return string(raw)
 }
 
-func resolveTeams(ps []dkParticipant) (home, away model.Team, ok bool) {
+func resolveTeams(sport string, ps []dkParticipant) (home, away model.Team, ok bool) {
 	homeName, awayName := "", ""
 	for _, p := range ps {
 		switch strings.ToLower(p.VenueRole) {
@@ -294,8 +341,8 @@ func resolveTeams(ps []dkParticipant) (home, away model.Team, ok bool) {
 			awayName = p.Name
 		}
 	}
-	h, okH := teams.Resolve("nfl", homeName)
-	a, okA := teams.Resolve("nfl", awayName)
+	h, okH := teams.Resolve(sport, homeName)
+	a, okA := teams.Resolve(sport, awayName)
 	return h, a, okH && okA
 }
 
@@ -381,7 +428,7 @@ func makeQuote(e dkEvent, m dkMarket, s dkSelection, c mainClass) (model.Quote, 
 	}
 	return model.Quote{
 		Book: Name, BookGameID: e.ID.String(), BookMarketID: m.ID.String(),
-		BookSelectionKey: s.ID.String(), Sport: "nfl", League: "nfl",
+		BookSelectionKey: s.ID.String(), Sport: e.sport, League: e.sport,
 		Family: c.family, Period: model.PeriodFull, Subject: "event",
 		Stat: c.stat, Comparator: c.comparator, Outcome: outcome, Line: model.CopyLine(line),
 		MarketName: m.Name, SelectionName: s.Label,
@@ -433,8 +480,10 @@ type dkEvent struct {
 	StartEventDate string          `json:"startEventDate"`
 	Status         string          `json:"status"`
 	Participants   []dkParticipant `json:"participants"`
+	LeagueID       ID              `json:"leagueId"`
 	homeID         string
 	awayID         string
+	sport          string
 }
 type dkMarketType struct {
 	Name string `json:"name"`

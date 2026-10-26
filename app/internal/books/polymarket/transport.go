@@ -19,8 +19,9 @@ import (
 // The CLOB market channel expects a text "PING" about every 10 s.
 const pingEvery = 10 * time.Second
 
-// Stream subscribes to every main-market token and emits the mid on each
-// book, price_change and best_bid_ask message. Port of go/internal/pm/ws.go.
+// Stream subscribes to every main-market token and emits the token's best
+// ask (the price to buy that outcome) on each book, price_change and
+// best_bid_ask message. Port of go/internal/pm/ws.go.
 func (b *bookImpl) Stream(ctx context.Context, snap *book.Snapshot, em book.Emitter) error {
 	sd, ok := snap.Private.(*seed)
 	if !ok || sd == nil {
@@ -195,7 +196,7 @@ func (sd *seed) update(asset string, bid, ask float64, recvAt, bookTS time.Time)
 	if bid <= 0 || ask <= 0 || ask > 1 || bid > ask {
 		return nil, nil
 	}
-	am, dec := convert((bid + ask) / 2)
+	am, dec := convert(ask)
 	status := model.StatusOpen
 	if am == 0 || t.closed {
 		status = model.StatusSuspended

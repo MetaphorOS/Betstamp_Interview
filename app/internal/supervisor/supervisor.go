@@ -90,8 +90,15 @@ type Supervisor struct {
 	connected      bool
 	everConnected  bool
 	snapFailing    bool
-	lastSnapshotAt time.Time
-	lastPollAt     time.Time
+	lastSnapshotAt time.Time // last attempt (rate limiting)
+	lastPollAt     time.Time // last attempt (rate limiting)
+	snapOKAt       time.Time
+	pollOKAt       time.Time
+	snapshots      int64
+	snapErrors     int64
+	polls          int64
+	pollErrors     int64
+	lastPollErr    string
 	lastErr        string
 
 	lastBeat atomic.Int64 // unix nanos
@@ -99,8 +106,21 @@ type Supervisor struct {
 	updates  atomic.Int64
 	lastData atomic.Int64
 
-	kill chan struct{}
-	seed *book.Snapshot // last good snapshot; owned by the Run goroutine
+	kill        chan struct{}
+	pausedUntil atomic.Int64   // unix nanos; demo/debug only
+	seed        *book.Snapshot // last good snapshot; owned by the Run goroutine
+}
+
+// Pause takes the book offline for d: it kills the stream and suspends
+// polls and snapshots, as if the book were unreachable. Debug/demo only; it
+// is how the page's stale handling can be shown on demand.
+func (s *Supervisor) Pause(d time.Duration) {
+	s.pausedUntil.Store(time.Now().Add(d).UnixNano())
+	s.KillStream()
+}
+
+func (s *Supervisor) paused() time.Duration {
+	return time.Until(time.Unix(0, s.pausedUntil.Load()))
 }
 
 // New builds a supervisor for one book.
@@ -153,6 +173,14 @@ func (s *Supervisor) Run(ctx context.Context) {
 	var next *book.Snapshot
 	needFresh := true // a resync needs a fresh snapshot; a socket drop does not
 	for ctx.Err() == nil {
+		if d := s.paused(); d > 0 {
+			s.log.Info("paused", "for", d.Round(time.Second))
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(d):
+			}
+		}
 		snap := next
 		next = nil
 		if snap == nil && !needFresh && s.seed != nil && !s.snapshotAllowed() {
@@ -291,6 +319,10 @@ func (s *Supervisor) snapshot(ctx context.Context) (snap *book.Snapshot, err err
 		s.snapFailing = err != nil
 		if err != nil {
 			s.lastErr = err.Error()
+			s.snapErrors++
+		} else {
+			s.snapshots++
+			s.snapOKAt = time.Now().UTC()
 		}
 		s.mu.Unlock()
 		s.evaluate(ctx)
@@ -303,6 +335,9 @@ func (s *Supervisor) snapshot(ctx context.Context) (snap *book.Snapshot, err err
 }
 
 func (s *Supervisor) poll(ctx context.Context, p book.Poller, seed *book.Snapshot) {
+	if s.paused() > 0 {
+		return
+	}
 	s.mu.Lock()
 	if time.Since(s.lastPollAt) < s.cfg.MinPollGap {
 		s.mu.Unlock()
@@ -324,10 +359,18 @@ func (s *Supervisor) poll(ctx context.Context, p book.Poller, seed *book.Snapsho
 			s.log.Warn("poll failed", "error", err)
 			s.mu.Lock()
 			s.lastErr = err.Error()
+			s.lastPollErr = err.Error()
+			s.pollErrors++
 			s.mu.Unlock()
 		}
+		s.evaluate(ctx)
 		return
 	}
+	s.mu.Lock()
+	s.polls++
+	s.pollOKAt = time.Now().UTC()
+	s.lastPollErr = ""
+	s.mu.Unlock()
 	for _, u := range ups {
 		if err := s.sink.Apply(ctx, u); err != nil {
 			return
@@ -508,7 +551,7 @@ func (s *Supervisor) healthLoop(ctx context.Context) {
 //	down:     snapshots failing and no recent data
 func (s *Supervisor) evaluate(ctx context.Context) {
 	now := time.Now().UTC()
-	lastData := time.Unix(0, s.lastData.Load())
+	lastData := time.Unix(0, s.lastData.Load()).UTC()
 	recent := s.lastData.Load() != 0 && now.Sub(lastData) <= s.cfg.StaleAfter
 	s.mu.Lock()
 	var st board.HealthState
@@ -541,6 +584,11 @@ func (s *Supervisor) evaluate(ctx context.Context) {
 	}
 	h.Frames, h.Updates = s.frames.Load(), s.updates.Load()
 	h.LastError = s.lastErr
+	if b := s.lastBeat.Load(); b != 0 && s.everConnected {
+		h.LastHeartbeatAt = time.Unix(0, b).UTC()
+	}
+	h.Polls, h.PollErrors, h.LastPollAt, h.LastPollError = s.polls, s.pollErrors, s.pollOKAt, s.lastPollErr
+	h.Snapshots, h.SnapshotErrors, h.LastSnapshotAt = s.snapshots, s.snapErrors, s.snapOKAt
 	s.health = h
 	s.mu.Unlock()
 	_ = s.sink.SetHealth(ctx, s.name, h)

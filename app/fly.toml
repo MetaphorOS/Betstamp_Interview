@@ -1,0 +1,30 @@
+# The app: one machine in Toronto, near the books. It must stay up (it is
+# the ingestion), so no auto-stop. Deploy only after fly.probe.toml shows the
+# books answer Fly's IPs.
+app = "betstamp-odds"
+primary_region = "yyz"
+
+[build]
+  [build.args]
+    CMD = "server"
+
+[env]
+  PORT = "8080"
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "off"
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "20s"
+    interval = "15s"
+    timeout = "5s"
+    method = "GET"
+    path = "/healthz"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"

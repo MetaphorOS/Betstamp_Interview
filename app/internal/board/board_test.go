@@ -14,7 +14,7 @@ var t0 = time.Date(2026, 10, 25, 17, 0, 0, 0, time.UTC)
 func f(v float64) *float64 { return &v }
 
 func TestBestPriceTable(t *testing.T) {
-	all := func(string) bool { return true }
+	all := func(string, Entry) bool { return true }
 	open := func(line *float64, am int) Entry {
 		return Entry{Line: line, American: am, Decimal: AmericanToDecimal(am), Status: model.StatusOpen, UpdatedAt: t0}
 	}
@@ -23,7 +23,7 @@ func TestBestPriceTable(t *testing.T) {
 		family   string
 		outcome  string
 		entries  map[string]Entry
-		eligible func(string) bool
+		eligible func(string, Entry) bool
 		want     string // "" = none
 	}{
 		{"favorite: -3 -110 beats -3.5 +100", model.FamilySpread, "nfl-vikings",
@@ -46,7 +46,7 @@ func TestBestPriceTable(t *testing.T) {
 		{"suspended is never best", model.FamilySpread, "nfl-vikings",
 			map[string]Entry{"a": {Line: f(-2.5), American: 200, Status: model.StatusSuspended, UpdatedAt: t0}, "b": open(f(-3.5), -110)}, all, "b"},
 		{"stale book is never best", model.FamilySpread, "nfl-vikings",
-			map[string]Entry{"a": open(f(-2.5), 200), "b": open(f(-3.5), -110)}, func(n string) bool { return n != "a" }, "b"},
+			map[string]Entry{"a": open(f(-2.5), 200), "b": open(f(-3.5), -110)}, func(n string, _ Entry) bool { return n != "a" }, "b"},
 		{"nothing eligible", model.FamilyMoneyline, "nfl-vikings",
 			map[string]Entry{"a": {American: 100, Status: model.StatusSuspended}}, all, ""},
 		{"exact tie: most recent", model.FamilyMoneyline, "nfl-vikings",
@@ -73,13 +73,38 @@ func TestBestPriceTable(t *testing.T) {
 	}
 }
 
-func TestProbabilityBookNeverBest(t *testing.T) {
+func TestProbabilityOnlyCompetesOnABookLine(t *testing.T) {
 	c := newTestCore(book.Descriptor{Name: "pm", PriceKind: book.PriceProbability})
-	c.apply(upd("dk", "dk-g", ml("nfl-vikings"), nil, -110, t0), t0)
-	c.apply(upd("pm", "pm-g", ml("nfl-vikings"), nil, 500, t0), t0)
-	s := c.slots[slotKey(c, "dk", "dk-g", ml("nfl-vikings"))]
-	if len(s.entries) != 2 || s.best == nil || s.best.Book != "dk" {
-		t.Fatalf("slot = %+v best=%+v", s.entries, s.best)
+	c.opts.ProbabilityInBest = true
+	under := model.MainIdentity(model.FamilyTotal, "under")
+	c.apply(upd("dk", "dk-g", under, f(207.5), -120, t0), t0)
+	// A stale market line: "better" for the bettor by rule 2, but a different bet.
+	c.apply(upd("pm", "pm-g", under, f(229.5), -3233, t0), t0)
+	s := c.slots[slotKey(c, "dk", "dk-g", under)]
+	if s.best == nil || s.best.Book != "dk" {
+		t.Fatalf("best = %+v, want dk", s.best)
+	}
+	// On the same line it competes on price.
+	c.apply(upd("pm", "pm-g", under, f(207.5), -105, t0.Add(time.Second)), t0.Add(time.Second))
+	if s := c.slots[slotKey(c, "dk", "dk-g", under)]; s.best == nil || s.best.Book != "pm" {
+		t.Fatalf("best = %+v, want pm on the same line", s.best)
+	}
+}
+
+func TestProbabilityBookBestOnlyWhenEnabled(t *testing.T) {
+	for _, in := range []bool{false, true} {
+		c := newTestCore(book.Descriptor{Name: "pm", PriceKind: book.PriceProbability})
+		c.opts.ProbabilityInBest = in
+		c.apply(upd("dk", "dk-g", ml("nfl-vikings"), nil, -110, t0), t0)
+		c.apply(upd("pm", "pm-g", ml("nfl-vikings"), nil, 500, t0), t0)
+		s := c.slots[slotKey(c, "dk", "dk-g", ml("nfl-vikings"))]
+		want := "dk"
+		if in {
+			want = "pm"
+		}
+		if len(s.entries) != 2 || s.best == nil || s.best.Book != want {
+			t.Fatalf("ProbabilityInBest=%v: best=%+v, want %s", in, s.best, want)
+		}
 	}
 }
 
@@ -100,7 +125,7 @@ func newTestCore(extra ...book.Descriptor) *core {
 		{Name: "dk", PriceKind: book.PriceAmerican}, {Name: "fd", PriceKind: book.PriceAmerican},
 	}, extra...)
 	now := t0
-	c := newCore(descs, func() time.Time { return now })
+	c := newCore(descs, func() time.Time { return now }, Options{})
 	for _, d := range descs {
 		c.applySnapshot(d.Name, &book.Snapshot{Games: []model.BookGame{game(d.Name, d.Name+"-g")}, AsOf: t0.Add(-time.Hour)})
 		c.setHealth(d.Name, Health{State: HealthLive})
@@ -238,7 +263,7 @@ func TestBooksMatchToOneCanonicalGame(t *testing.T) {
 }
 
 func TestSlowSubscriberDroppedAndSeqIncreases(t *testing.T) {
-	b := newBoard([]book.Descriptor{{Name: "dk", PriceKind: book.PriceAmerican}}, func() time.Time { return t0 })
+	b := newBoard([]book.Descriptor{{Name: "dk", PriceKind: book.PriceAmerican}}, func() time.Time { return t0 }, Options{})
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go b.Run(ctx)
@@ -297,5 +322,66 @@ func TestSlowSubscriberDroppedAndSeqIncreases(t *testing.T) {
 	}
 	if _, _, err := b.Snapshot(ctx); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestFinishedGameClosesThenLeaves(t *testing.T) {
+	now := t0.Add(3 * time.Hour) // well after kickoff
+	c := newTestCore()
+	c.now = func() time.Time { return now }
+	id := ml("nfl-vikings")
+	live := upd("fd", "fd-g", id, nil, -5000, now)
+	live.InPlay = true
+	c.apply(live, now)
+	gid := c.gameRefs["fd"]["fd-g"]
+	if st := c.games[gid].view.Status; st != GameLive {
+		t.Fatalf("status %q, want live", st)
+	}
+	// Final whistle: the book suspends everything and keeps it listed.
+	live.Status, live.RecvAt = model.StatusSuspended, now.Add(time.Second)
+	c.apply(live, now.Add(time.Second))
+	if st := c.games[gid].view.Status; st != GameSuspended {
+		t.Fatalf("status %q, want suspended", st)
+	}
+	c.tick(now.Add(2 * time.Minute))
+	if st := c.games[gid].view.Status; st != GameSuspended {
+		t.Fatalf("closed too early: %q", st)
+	}
+	c.tick(now.Add(4 * time.Minute))
+	if st := c.games[gid].view.Status; st != GameClosed {
+		t.Fatalf("status %q, want closed", st)
+	}
+	_, drain := collect(c)
+	c.tick(now.Add(20 * time.Minute))
+	if len(c.slots) != 0 || len(c.state().Games) != 0 {
+		t.Fatalf("closed game not pruned: slots=%d", len(c.slots))
+	}
+	ds := drain()
+	if len(ds) != 1 || ds[0].Kind != KindGame || !ds[0].Removed {
+		t.Fatalf("deltas %+v", ds)
+	}
+	// More suspended quotes do not bring it back; an open price does.
+	live.RecvAt = now.Add(21 * time.Minute)
+	c.apply(live, now.Add(21*time.Minute))
+	if len(c.slots) != 0 {
+		t.Fatal("suspended quote revived a pruned game")
+	}
+	live.Status = model.StatusOpen
+	c.apply(live, now.Add(22*time.Minute))
+	if st := c.games[gid].view.Status; len(c.slots) != 1 || st != GameLive {
+		t.Fatalf("reopened game: slots=%d status=%q", len(c.slots), st)
+	}
+}
+
+func TestPregameSuspensionIsNotClosed(t *testing.T) {
+	c := newTestCore()
+	early := t0.Add(-time.Hour) // before kickoff
+	c.now = func() time.Time { return early }
+	u := upd("fd", "fd-g", ml("nfl-vikings"), nil, 120, early)
+	u.Status = model.StatusSuspended
+	c.apply(u, early)
+	c.tick(early.Add(30 * time.Minute))
+	if st := c.games[c.gameRefs["fd"]["fd-g"]].view.Status; st != GamePregame {
+		t.Fatalf("status %q, want pregame", st)
 	}
 }

@@ -78,7 +78,7 @@ func main() {
 	ctx, cancel := context.WithTimeout(ctx, time.Duration(*seconds)*time.Second)
 	defer cancel()
 
-	bd := board.New(descs)
+	bd := board.New(descs, board.Options{ProbabilityInBest: true})
 	boardCtx, stopBoard := context.WithCancel(context.Background())
 	go bd.Run(boardCtx)
 	defer stopBoard()

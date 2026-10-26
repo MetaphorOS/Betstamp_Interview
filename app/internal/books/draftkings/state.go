@@ -19,8 +19,8 @@ const (
 )
 
 type evState struct {
-	homeID, awayID string
-	live, removed  bool
+	homeID, awayID, sport string
+	live, removed         bool
 }
 
 type mktState struct {
@@ -62,6 +62,7 @@ type state struct {
 	owner         map[string]string
 	tombs         map[string]*tomb
 	partials      []map[string]any
+	leagueSport   map[string]string // DK leagueId -> sport
 	stats         Stats
 }
 
@@ -70,7 +71,7 @@ func newState() *state {
 		events: map[string]*evState{}, ignoredEvents: map[string]bool{},
 		markets: map[string]*mktState{}, ignored: map[string]bool{}, goneMarkets: map[string]bool{},
 		sels: map[string]*selState{}, skipSels: map[string]bool{}, gone: map[string]bool{},
-		owner: map[string]string{}, tombs: map[string]*tomb{},
+		owner: map[string]string{}, tombs: map[string]*tomb{}, leagueSport: map[string]string{},
 	}
 }
 
@@ -108,6 +109,9 @@ func (s *state) clone() *state {
 		c.owner[k] = v
 	}
 	c.partials = s.partials
+	for k, v := range s.leagueSport {
+		c.leagueSport[k] = v
+	}
 	return c
 }
 
@@ -247,7 +251,7 @@ func (a *applier) upsertEvent(e dkEvent, isAdd bool) error {
 		if s.ignoredEvents[id] {
 			return nil
 		}
-		home, away, ok := resolveTeams(e.Participants)
+		home, away, ok := s.resolveNew(e)
 		if !ok {
 			// Not an NFL pairing we can map; never guess.
 			s.ignoredEvents[id] = true
@@ -257,7 +261,7 @@ func (a *applier) upsertEvent(e dkEvent, isAdd bool) error {
 		// A new game: the board cannot place it without a snapshot.
 		return fmt.Errorf("%w: new event %s (%s @ %s)", book.ErrResync, id, away.ID, home.ID)
 	}
-	if home, away, ok := resolveTeams(e.Participants); ok {
+	if home, away, ok := resolveTeams(ev.sport, e.Participants); ok {
 		ev.homeID, ev.awayID = home.ID, away.ID
 	}
 	if isAdd {
@@ -272,6 +276,20 @@ func (a *applier) upsertEvent(e dkEvent, isAdd bool) error {
 		}
 	}
 	return nil
+}
+
+// resolveNew resolves an event we have not seen, by its league when DK says
+// which one, otherwise against every league we subscribe to.
+func (s *state) resolveNew(e dkEvent) (home, away model.Team, ok bool) {
+	if sport := s.leagueSport[e.LeagueID.String()]; sport != "" {
+		return resolveTeams(sport, e.Participants)
+	}
+	for _, sport := range s.leagueSport {
+		if h, a, ok := resolveTeams(sport, e.Participants); ok {
+			return h, a, true
+		}
+	}
+	return model.Team{}, model.Team{}, false
 }
 
 func (a *applier) addMarket(m dkMarket) {

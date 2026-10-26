@@ -231,3 +231,25 @@ func TestSnapshotPricesComeFromSMP(t *testing.T) {
 	}
 	t.Logf("refreshed %d quotes from SMP", checked)
 }
+
+func TestNBABoardFiltersCompetition(t *testing.T) {
+	raw, err := os.ReadFile(testdata("fd-nba.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ParseLeagueBoards(time.Now(), DefaultLeagues, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("nba games=%d quotes=%d skipped=%v", len(snap.Games), len(snap.Quotes), snap.Skipped)
+	// The research filter (competition 10547864) gave 7 events / 42 selections;
+	// the other basketball competition on the board must not leak in.
+	if len(snap.Games) != 7 || len(snap.Quotes) != 42 {
+		t.Fatalf("games=%d quotes=%d, want 7 / 42", len(snap.Games), len(snap.Quotes))
+	}
+	for _, g := range snap.Games {
+		if g.Sport != "nba" || !strings.HasPrefix(g.Home.ID, "nba-") {
+			t.Fatalf("bad game %+v", g)
+		}
+	}
+}

@@ -39,7 +39,7 @@ func seedState(t *testing.T) *state {
 			sel("OU_U4150_3", "3_m", "Under", ptr(41.5), "−110"),
 		},
 	}
-	snap, err := buildSnapshot(doc, t0)
+	snap, err := buildSnapshot(t0, leagueDoc{league: DefaultLeagues[0], doc: doc})
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -31,3 +31,24 @@ func TestRefusesUnknown(t *testing.T) {
 		t.Fatal("empty resolved")
 	}
 }
+
+func TestNBAWholeWords(t *testing.T) {
+	cases := map[string]string{
+		"Charlotte Hornets": "nba-hornets", "BKN Nets": "nba-nets", "Brooklyn Nets": "nba-nets",
+		"LA Lakers": "nba-lakers", "LA Clippers": "nba-clippers", "Portland Trail Blazers": "nba-trail-blazers",
+		"PHI 76ers": "nba-76ers", "GS Warriors": "nba-warriors", "Jazz": "nba-jazz",
+		"Sacramento Kings": "nba-kings", "OKC Thunder": "nba-thunder",
+	}
+	for name, want := range cases {
+		got, ok := Resolve("nba", name)
+		if !ok || got.ID != want {
+			t.Errorf("%q => %+v %v, want %s", name, got, ok, want)
+		}
+	}
+	if _, ok := Resolve("nba", "Kansas City Chiefs"); ok {
+		t.Error("NFL team resolved as NBA")
+	}
+	if got, ok := Resolve("nfl", "Sacramento Kings"); ok {
+		t.Errorf("NBA team resolved as NFL: %+v", got)
+	}
+}

@@ -1,6 +1,8 @@
 package draftkings
 
 import (
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -35,7 +37,7 @@ func TestSnapshotUsesTrueOddsAndLiveState(t *testing.T) {
 			TrueOdds:    &trueOdds, Status: "Suspended",
 		}},
 	}
-	snap, err := buildSnapshot(doc, time.Now())
+	snap, err := buildSnapshot(time.Now(), leagueDoc{league: DefaultLeagues[0], doc: doc})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -54,5 +56,28 @@ func TestSnapshotUsesTrueOddsAndLiveState(t *testing.T) {
 	}
 	if _, ok := snap.Private.(*state).sels[q.BookSelectionKey]; !ok {
 		t.Fatal("seed missing selection")
+	}
+}
+
+func TestNBASnapshot(t *testing.T) {
+	raw, err := os.ReadFile(testdata("dk-nba.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ParseLeagueSnapshot(raw, League{Sport: "nba", ID: "42648"}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("nba games=%d quotes=%d skipped=%v", len(snap.Games), len(snap.Quotes), snap.Skipped)
+	if len(snap.Games) != 12 || len(snap.Quotes) != 72 {
+		t.Fatalf("games=%d quotes=%d, research capture has 12 / 72", len(snap.Games), len(snap.Quotes))
+	}
+	for _, q := range snap.Quotes {
+		if q.Sport != "nba" || !strings.HasPrefix(q.Outcome, "nba-") && q.Family != model.FamilyTotal {
+			t.Fatalf("bad quote %+v", q)
+		}
+	}
+	if !strings.Contains(snap.Subscription, "42648") {
+		t.Fatalf("subscription %s", snap.Subscription)
 	}
 }

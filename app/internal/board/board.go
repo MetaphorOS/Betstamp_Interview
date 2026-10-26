@@ -6,6 +6,7 @@ package board
 
 import (
 	"context"
+	"slices"
 	"sort"
 	"time"
 
@@ -36,7 +37,21 @@ type Health struct {
 	Frames         int64       `json:"frames"`
 	Updates        int64       `json:"updates"`
 	LastError      string      `json:"lastError,omitempty"`
+
+	// Push channel and REST detail, so the page can show both paths.
+	LastHeartbeatAt time.Time `json:"lastHeartbeatAt,omitzero"`
+	Polls           int64     `json:"polls"`
+	PollErrors      int64     `json:"pollErrors"`
+	LastPollAt      time.Time `json:"lastPollAt,omitzero"` // last successful poll
+	LastPollError   string    `json:"lastPollError,omitempty"`
+	Snapshots       int64     `json:"snapshots"`
+	SnapshotErrors  int64     `json:"snapshotErrors"`
+	LastSnapshotAt  time.Time `json:"lastSnapshotAt,omitzero"` // last successful snapshot
 }
+
+// healthRefresh: even without a state change, re-publish health this often so
+// heartbeat and poll ages on the page stay current.
+const healthRefresh = 5 * time.Second
 
 // excluded reports whether a book in this state is shown greyed and never best.
 func (h Health) excluded() bool { return h.State == HealthStale || h.State == HealthDown }
@@ -95,11 +110,13 @@ type Delta struct {
 
 // GameView is a canonical game as the page shows it.
 type GameView struct {
-	ID    string     `json:"id"`
-	Start time.Time  `json:"start"`
-	Away  model.Team `json:"away"`
-	Home  model.Team `json:"home"`
-	Live  bool       `json:"live"`
+	ID     string     `json:"id"`
+	Sport  string     `json:"sport"`
+	Status string     `json:"status"` // pregame | live | suspended | closed
+	Start  time.Time  `json:"start"`
+	Away   model.Team `json:"away"`
+	Home   model.Team `json:"home"`
+	Live   bool       `json:"live"`
 }
 
 // SlotView is one slot in a State.
@@ -115,6 +132,7 @@ type SlotView struct {
 // State is a full board snapshot.
 type State struct {
 	Seq     uint64                  `json:"seq"`
+	Options Options                 `json:"options"`
 	Books   []book.Descriptor       `json:"books"`
 	Games   []GameView              `json:"games"`
 	Slots   []SlotView              `json:"slots"`
@@ -130,33 +148,134 @@ type slot struct {
 }
 
 type gameState struct {
-	view  GameView
-	slots int // slots with at least one entry
+	view       GameView
+	slots      int             // slots with at least one entry
+	keys       map[string]bool // those slots' keys
+	lastOpenAt time.Time       // last time any book offered an open price on it
+	pruned     bool            // closed long enough to be taken off the board
+}
+
+// Game statuses. Books rarely say "final": DK deletes the event, but FD and
+// Polymarket can leave a finished game up with every market suspended. So a
+// started game with no open price anywhere for CloseAfter is shown as closed
+// (likely final), and taken off the board PruneAfter later. Any open price
+// brings it straight back.
+const (
+	GamePregame   = "pregame"
+	GameLive      = "live"
+	GameSuspended = "suspended" // started, nothing open for less than CloseAfter
+	GameClosed    = "closed"
+)
+
+func (c *core) gameStatus(gs *gameState, now time.Time) string {
+	open := false
+	for key := range gs.keys {
+		if s := c.slots[key]; s != nil {
+			for _, e := range s.entries {
+				if e.Status == model.StatusOpen {
+					open = true
+					break
+				}
+			}
+		}
+		if open {
+			break
+		}
+	}
+	started := gs.view.Live || !now.Before(gs.view.Start)
+	switch {
+	case open && gs.view.Live:
+		return GameLive
+	case open || !started:
+		return GamePregame
+	case now.Sub(gs.lastOpenAt) < c.opts.CloseAfter:
+		return GameSuspended
+	default:
+		return GameClosed
+	}
+}
+
+// refreshGame recomputes one game's status and publishes a change.
+func (c *core) refreshGame(gid string, now time.Time) {
+	gs := c.games[gid]
+	if gs == nil || gs.slots == 0 {
+		return
+	}
+	st := c.gameStatus(gs, now)
+	if st == gs.view.Status {
+		return
+	}
+	gs.view.Status = st
+	v := gs.view
+	c.publish(Delta{Kind: KindGame, GameID: gid, Game: &v, AppliedAt: now})
+}
+
+// tick runs the time-based transitions: suspended -> closed -> pruned.
+func (c *core) tick(now time.Time) {
+	ids := make([]string, 0, len(c.games))
+	for id := range c.games {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, id := range ids {
+		gs := c.games[id]
+		if gs.slots == 0 {
+			continue
+		}
+		c.refreshGame(id, now)
+		if gs.view.Status == GameClosed && now.Sub(gs.lastOpenAt) >= c.opts.CloseAfter+c.opts.PruneAfter {
+			for key := range gs.keys {
+				delete(c.slots, key)
+			}
+			gs.keys, gs.slots, gs.pruned = map[string]bool{}, 0, true
+			v := gs.view
+			c.publish(Delta{Kind: KindGame, GameID: id, Game: &v, Removed: true, AppliedAt: now})
+		}
+	}
+}
+
+// Options changes board policy.
+type Options struct {
+	// ProbabilityInBest lets prediction-market prices (priced at the cost
+	// to buy the outcome) compete for best price. Off, they are shown only.
+	ProbabilityInBest bool
+	// CloseAfter: a started game with no open price this long is closed.
+	CloseAfter time.Duration `json:"-"`
+	// PruneAfter: a closed game leaves the board this much later.
+	PruneAfter time.Duration `json:"-"`
 }
 
 // core is the board logic, owned by one goroutine (or a test).
 type core struct {
-	now      func() time.Time
-	matcher  *match.Matcher
-	books    []book.Descriptor
-	kind     map[string]book.PriceKind
-	gameRefs map[string]map[string]string // book -> book game id -> canonical id
-	games    map[string]*gameState
-	slots    map[string]*slot
-	health   map[string]Health
-	latency  map[string]*latencyWindow
-	dropped  map[string]int
-	seq      uint64
-	subs     map[int]chan Delta
-	nextSub  int
+	opts       Options
+	now        func() time.Time
+	matcher    *match.Matcher
+	books      []book.Descriptor
+	kind       map[string]book.PriceKind
+	gameRefs   map[string]map[string]string // book -> book game id -> canonical id
+	games      map[string]*gameState
+	slots      map[string]*slot
+	health     map[string]Health
+	latency    map[string]*latencyWindow
+	dropped    map[string]int
+	healthSent map[string]time.Time
+	seq        uint64
+	subs       map[int]chan Delta
+	nextSub    int
 }
 
-func newCore(books []book.Descriptor, now func() time.Time) *core {
+func newCore(books []book.Descriptor, now func() time.Time, opts Options) *core {
+	if opts.CloseAfter == 0 {
+		opts.CloseAfter = 3 * time.Minute
+	}
+	if opts.PruneAfter == 0 {
+		opts.PruneAfter = 15 * time.Minute
+	}
 	c := &core{
-		now: now, matcher: match.New(), books: books, kind: map[string]book.PriceKind{},
+		opts: opts, now: now, matcher: match.New(), books: books, kind: map[string]book.PriceKind{},
 		gameRefs: map[string]map[string]string{}, games: map[string]*gameState{},
 		slots: map[string]*slot{}, health: map[string]Health{}, latency: map[string]*latencyWindow{},
-		dropped: map[string]int{}, subs: map[int]chan Delta{},
+		dropped: map[string]int{}, subs: map[int]chan Delta{}, healthSent: map[string]time.Time{},
 	}
 	for _, d := range books {
 		c.kind[d.Name] = d.PriceKind
@@ -169,8 +288,37 @@ func newCore(books []book.Descriptor, now func() time.Time) *core {
 // MatchTolerance is how far apart two books' start times may be for one game.
 const MatchTolerance = 3 * time.Hour
 
+// pickBest applies the best-price rule to one slot.
+func (c *core) pickBest(s *slot) *Best {
+	// Lines the sportsbooks offer right now; prediction markets must match one.
+	var bookLines []string
+	for name, e := range s.entries {
+		if c.kind[name] == book.PriceAmerican && e.Status == model.StatusOpen && c.eligible(name) {
+			bookLines = append(bookLines, model.LineString(e.Line))
+		}
+	}
+	return PickBest(s.family, s.outcome, s.entries, func(name string, e Entry) bool {
+		if !c.eligible(name) {
+			return false
+		}
+		if c.kind[name] != book.PriceProbability || s.family == model.FamilyMoneyline || len(bookLines) == 0 {
+			return true
+		}
+		return slices.Contains(bookLines, model.LineString(e.Line))
+	})
+}
+
 func (c *core) eligible(name string) bool {
-	return c.kind[name] == book.PriceAmerican && !c.health[name].excluded()
+	if c.health[name].excluded() {
+		return false
+	}
+	switch c.kind[name] {
+	case book.PriceAmerican:
+		return true
+	case book.PriceProbability:
+		return c.opts.ProbabilityInBest
+	}
+	return false
 }
 
 func (c *core) publish(d Delta) {
@@ -210,7 +358,7 @@ func (c *core) applySnapshot(name string, snap *book.Snapshot) {
 		refs[g.BookGameID] = p.Game.ID
 		gs := c.games[p.Game.ID]
 		if gs == nil {
-			gs = &gameState{view: GameView{ID: p.Game.ID, Start: p.Game.Start, Away: p.Game.Away, Home: p.Game.Home}}
+			gs = &gameState{keys: map[string]bool{}, view: GameView{ID: p.Game.ID, Sport: p.Game.Sport, Start: p.Game.Start, Away: p.Game.Away, Home: p.Game.Home}}
 			c.games[p.Game.ID] = gs
 		}
 		if g.Live && !gs.view.Live {
@@ -255,6 +403,17 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	if !ok {
 		return
 	}
+	gs := c.games[gid]
+	if gs != nil && gs.pruned {
+		if u.Status != model.StatusOpen {
+			return // a closed game's suspended quotes do not bring it back
+		}
+		gs.pruned = false
+	}
+	if gs != nil && u.Status == model.StatusOpen {
+		gs.lastOpenAt = appliedAt
+	}
+	defer c.refreshGame(gid, appliedAt)
 	if lw := c.latency[u.Book]; lw != nil && u.Source == model.SourceStream {
 		lw.add(appliedAt.Sub(u.RecvAt), u.RecvAt, u.BookTS)
 	}
@@ -283,6 +442,7 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 		Line: model.CopyLine(u.Line), American: u.American, Decimal: u.Decimal,
 		Status: u.Status, InPlay: u.InPlay, UpdatedAt: u.RecvAt, BookTS: u.BookTS,
 	}
+	appeared := false
 	if had {
 		e.Prev = old.Prev
 		if model.LineString(old.Line) != model.LineString(e.Line) || old.American != e.American {
@@ -296,16 +456,24 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 			}
 			return
 		}
-	} else if gs := c.games[gid]; gs != nil && len(s.entries) == 0 {
+	} else if gs != nil && len(s.entries) == 0 {
 		// The slot gets its first entry; the game appears with its first slot.
 		gs.slots++
+		gs.keys[key] = true
 		if gs.slots == 1 {
-			v := gs.view
-			c.publish(Delta{Kind: KindGame, GameID: gid, Game: &v, AppliedAt: appliedAt})
+			if gs.lastOpenAt.IsZero() {
+				gs.lastOpenAt = appliedAt // first sight starts the clock
+			}
+			appeared = true
 		}
 	}
 	s.entries[u.Book] = e
-	s.best = PickBest(s.family, s.outcome, s.entries, c.eligible)
+	if appeared {
+		gs.view.Status = c.gameStatus(gs, appliedAt)
+		v := gs.view
+		c.publish(Delta{Kind: KindGame, GameID: gid, Game: &v, AppliedAt: appliedAt})
+	}
+	s.best = c.pickBest(s)
 	ec := e
 	base.Kind, base.GameID, base.Identity, base.Book, base.Entry, base.Best = KindSlot, gid, u.Identity, u.Book, &ec, copyBest(s.best)
 	c.publish(base)
@@ -325,12 +493,13 @@ func visibleChange(a, b Entry) bool {
 
 func (c *core) removeEntry(s *slot, name string, base Delta) {
 	delete(s.entries, name)
-	s.best = PickBest(s.family, s.outcome, s.entries, c.eligible)
+	s.best = c.pickBest(s)
 	base.Kind, base.GameID, base.Identity, base.Book, base.Removed, base.Best = KindSlot, s.gameID, s.identity, name, true, copyBest(s.best)
 	c.publish(base)
 	if len(s.entries) == 0 {
 		delete(c.slots, s.gameID+"|"+s.identity)
 		if gs := c.games[s.gameID]; gs != nil {
+			delete(gs.keys, s.gameID+"|"+s.identity)
 			gs.slots--
 			if gs.slots == 0 {
 				v := gs.view
@@ -352,11 +521,16 @@ func copyBest(b *Best) *Best {
 func (c *core) setHealth(name string, h Health) {
 	old := c.health[name]
 	c.health[name] = h
-	if old.State == h.State && old.LastError == h.LastError && old.Reconnects == h.Reconnects && old.Resyncs == h.Resyncs {
-		// Counters and timestamps move constantly; publish only state changes.
+	now := c.now()
+	changed := old.State != h.State || old.LastError != h.LastError || old.Reconnects != h.Reconnects ||
+		old.Resyncs != h.Resyncs || old.Polls != h.Polls || old.PollErrors != h.PollErrors ||
+		old.Snapshots != h.Snapshots || old.SnapshotErrors != h.SnapshotErrors
+	// Frame and update counters move constantly; they ride along on the
+	// periodic refresh instead of triggering a delta each.
+	if !changed && now.Sub(c.healthSent[name]) < healthRefresh {
 		return
 	}
-	now := c.now()
+	c.healthSent[name] = now
 	hc := h
 	c.publish(Delta{Kind: KindHealth, Book: name, Health: &hc, AppliedAt: now})
 	if old.excluded() == h.excluded() {
@@ -372,7 +546,7 @@ func (c *core) setHealth(name string, h Health) {
 	sort.Strings(keys)
 	for _, key := range keys {
 		s := c.slots[key]
-		nb := PickBest(s.family, s.outcome, s.entries, c.eligible)
+		nb := c.pickBest(s)
 		if sameBest(nb, s.best) {
 			continue
 		}
@@ -383,7 +557,7 @@ func (c *core) setHealth(name string, h Health) {
 
 func (c *core) state() State {
 	st := State{
-		Seq: c.seq, Books: append([]book.Descriptor(nil), c.books...),
+		Seq: c.seq, Options: c.opts, Books: append([]book.Descriptor(nil), c.books...),
 		Health: map[string]Health{}, Latency: map[string]LatencyStats{}, Dropped: map[string]int{},
 	}
 	for k, v := range c.health {
@@ -447,19 +621,23 @@ type Board struct {
 const SubscriberBuffer = 1024
 
 // New builds a board for the registered books. Call Run.
-func New(books []book.Descriptor) *Board {
-	return newBoard(books, func() time.Time { return time.Now() })
+func New(books []book.Descriptor, opts Options) *Board {
+	return newBoard(books, func() time.Time { return time.Now() }, opts)
 }
 
-func newBoard(books []book.Descriptor, now func() time.Time) *Board {
-	return &Board{inbox: make(chan func(*core), 4096), done: make(chan struct{}), c: newCore(books, now)}
+func newBoard(books []book.Descriptor, now func() time.Time, opts Options) *Board {
+	return &Board{inbox: make(chan func(*core), 4096), done: make(chan struct{}), c: newCore(books, now, opts)}
 }
 
 // Run processes commands until ctx ends.
 func (b *Board) Run(ctx context.Context) {
 	defer close(b.done)
+	tick := time.NewTicker(5 * time.Second)
+	defer tick.Stop()
 	for {
 		select {
+		case <-tick.C:
+			b.c.tick(b.c.now())
 		case <-ctx.Done():
 			for id := range b.c.subs {
 				b.c.unsubscribe(id)

@@ -1,0 +1,26 @@
+# Throwaway probe: does DK/FD/PM data work from Fly's Toronto IPs?
+#   fly launch --no-deploy --copy-config -c fly.probe.toml --name <unique-name>
+#   fly deploy -c fly.probe.toml
+#   fly logs -c fly.probe.toml            # the startup probe JSON
+#   curl https://<unique-name>.fly.dev/probe
+#   fly apps destroy <unique-name>        # when done
+app = "betstamp-probe"
+primary_region = "yyz"
+
+[build]
+  [build.args]
+    CMD = "probe"
+
+[experimental]
+  cmd = ["-serve", ":8080", "-listen", "15s"]
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = "stop"
+  auto_start_machines = true
+  min_machines_running = 0
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "256mb"

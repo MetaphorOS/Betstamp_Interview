@@ -8,9 +8,12 @@ import (
 
 // Best price rule.
 //
-//  1. Eligible quotes: status open, the book's health is not stale/down, and
-//     the book quotes sportsbook (american) odds. Prediction-market prices are
-//     shown but never best.
+//  1. Eligible quotes: status open and the book's health is not stale/down.
+//     Prediction markets compete only with Options.ProbabilityInBest; their
+//     price is the cost to buy the outcome (the ask), not the mid. On a spread
+//     or total they compete only on a line some sportsbook also offers: a
+//     market line far from the books' (e.g. under 229.5 at -3233 against
+//     207.5 at -120) is a different bet, and rule 2 would wrongly prefer it.
 //  2. The better line for the bettor wins:
 //     - spread: higher signed line (+3.5 beats +3; -3 beats -3.5);
 //     - over: lower total;
@@ -83,10 +86,10 @@ func better(family, outcome string, a, b candidate) bool {
 }
 
 // PickBest returns the best eligible entry, or nil when none is eligible.
-func PickBest(family, outcome string, entries map[string]Entry, eligible func(book string) bool) *Best {
+func PickBest(family, outcome string, entries map[string]Entry, eligible func(book string, e Entry) bool) *Best {
 	var best *candidate
 	for name, e := range entries {
-		if e.Status != model.StatusOpen || !eligible(name) {
+		if e.Status != model.StatusOpen || !eligible(name, e) {
 			continue
 		}
 		c := candidate{book: name, entry: e}

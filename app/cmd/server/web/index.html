@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Odds Board</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>Odds Board</h1>
+    <span class="sub">DraftKings · FanDuel · Polymarket · Ontario · live push</span>
+  </div>
+  <nav class="modes" id="modes" aria-label="Price source"></nav>
+  <div class="toggles">
+    <nav class="seg" id="leagues" aria-label="League"></nav>
+    <nav class="seg" id="formats" aria-label="Odds format"></nav>
+  </div>
+  <div class="conn" id="conn" title="Browser connection to this server (Server-Sent Events)">
+    <span class="dot"></span><span class="conn-text">connecting…</span>
+  </div>
+</header>
+
+<section class="health" id="health" aria-label="Book health"></section>
+
+<main id="board">
+  <p class="empty" id="empty">Waiting for the first snapshot…</p>
+</main>
+
+<footer class="foot">
+  <p><b>Best price</b>: the better line for the bettor wins first (higher spread, lower over, higher under), then better odds;
+  ties go to the most recently updated book. Suspended prices and stale or down books are never best.</p>
+  <p><b>Polymarket</b> is a prediction market. Its price is what buying that outcome costs right now (the best ask),
+  converted to odds. It ignores fees and how much is available at that price, and Polymarket is not open to every region.</p>
+  <p>Cells flash green when the price got better for the bettor and red when it got worse; the struck-through price is the one it replaced.
+  Ages are measured against server time.</p>
+</footer>
+
+<script src="app.js"></script>
+</body>
+</html>

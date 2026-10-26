@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -88,8 +89,8 @@ func TestStreamMessages(t *testing.T) {
 	if len(got) != 2 {
 		t.Fatalf("updates = %+v", got)
 	}
-	// mid 0.56 -> -127; mid 0.61 -> -156
-	if got[0].American != -127 || got[1].American != -156 || !got[0].BookTS.IsZero() || got[1].BookTS.IsZero() {
+	// priced at the ask (cost to buy): 0.57 -> -133; 0.62 -> -163
+	if got[0].American != -133 || got[1].American != -163 || !got[0].BookTS.IsZero() || got[1].BookTS.IsZero() {
 		t.Fatalf("prices %+v", got)
 	}
 	if ups, err := sd.apply([]byte("PONG"), time.Now()); err != nil || ups != nil {
@@ -104,6 +105,26 @@ func TestConvert(t *testing.T) {
 	}{{0.5, 100}, {0.25, 300}, {0.8, -400}, {0.0001, 0}} {
 		if am, _ := convert(c.p); am != c.am {
 			t.Fatalf("convert(%v) = %d, want %d", c.p, am, c.am)
+		}
+	}
+}
+
+func TestNBASeries(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "testdata", "pm-nba-events.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	snap, err := ParseSeriesEvents(raw, "nba", time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("nba games=%d quotes=%d skipped=%v", len(snap.Games), len(snap.Quotes), snap.Skipped)
+	if len(snap.Games) == 0 {
+		t.Fatal("no NBA games")
+	}
+	for _, g := range snap.Games {
+		if g.Sport != "nba" || !strings.HasPrefix(g.Home.ID, "nba-") || !strings.HasPrefix(g.Away.ID, "nba-") {
+			t.Fatalf("bad game %+v", g)
 		}
 	}
 }

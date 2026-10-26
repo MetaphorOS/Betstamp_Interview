@@ -1,7 +1,8 @@
 // Package polymarket implements Polymarket NFL game markets: Gamma REST for
 // structure and prices, the CLOB market WebSocket for push. It is a
-// prediction market, so its prices are probabilities: the board shows them
-// (converted to implied american odds) but never picks them as best.
+// prediction market: an outcome token costs p dollars and pays $1. Its price
+// here is the best ASK (what buying that outcome costs right now), converted
+// to american/decimal odds, so it is comparable with a sportsbook price.
 //
 // It exists to prove a third book needs no framework change: this package,
 // its fixtures, and one Register line.
@@ -27,8 +28,7 @@ import (
 
 const (
 	Name          = "polymarket"
-	NFLSeries     = "12185"
-	DefaultURL    = "https://gamma-api.polymarket.com/events?series_id=" + NFLSeries + "&closed=false&limit=100"
+	EventsURL     = "https://gamma-api.polymarket.com/events?closed=false&limit=100&series_id="
 	DefaultWSURL  = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 	DefaultUA     = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 	typeMoneyline = "moneyline"
@@ -36,10 +36,19 @@ const (
 	typeTotals    = "totals"
 )
 
+// Series is one Gamma series (a league).
+type Series struct {
+	Sport string
+	ID    string
+}
+
+// DefaultSeries: NFL and NBA.
+var DefaultSeries = []Series{{Sport: "nfl", ID: "12185"}, {Sport: "nba", ID: "10345"}}
+
 // Config is owned by this package.
 type Config struct {
-	URL       string
-	Path      string // read Gamma events from a file (tests)
+	Series    []Series
+	Path      string // read NFL Gamma events from a file (tests)
 	WSURL     string
 	Timeout   time.Duration
 	UserAgent string
@@ -51,8 +60,8 @@ type bookImpl struct {
 }
 
 func New(cfg Config) (book.Book, error) {
-	if cfg.URL == "" && cfg.Path == "" {
-		cfg.URL = DefaultURL
+	if len(cfg.Series) == 0 {
+		cfg.Series = DefaultSeries
 	}
 	if cfg.WSURL == "" {
 		cfg.WSURL = DefaultWSURL
@@ -71,16 +80,34 @@ func (b *bookImpl) Descriptor() book.Descriptor {
 }
 
 func (b *bookImpl) Tuning() book.Tuning {
-	return book.Tuning{ReconcileEvery: time.Minute, MinSnapshotGap: 30 * time.Second, MinPollGap: 30 * time.Second}
+	// Resnapshot every minute: the main spread/total line moves during a game,
+	// and a new main line means new tokens, so the stream must resubscribe.
+	return book.Tuning{ReconcileEvery: time.Minute, ResnapshotEvery: time.Minute,
+		MinSnapshotGap: 30 * time.Second, MinPollGap: 30 * time.Second}
 }
 
 func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 	asOf := time.Now()
-	raw, err := b.read(ctx)
-	if err != nil {
-		return nil, err
+	if b.cfg.Path != "" {
+		raw, err := os.ReadFile(b.cfg.Path)
+		if err != nil {
+			return nil, err
+		}
+		return ParseEvents(raw, asOf)
 	}
-	return ParseEvents(raw, asOf)
+	var docs []seriesDoc
+	for _, sr := range b.cfg.Series {
+		raw, err := b.read(ctx, EventsURL+sr.ID)
+		if err != nil {
+			return nil, fmt.Errorf("%s: %w", sr.Sport, err)
+		}
+		events, err := decodeEvents(raw)
+		if err != nil {
+			return nil, err
+		}
+		docs = append(docs, seriesDoc{sport: sr.Sport, events: events})
+	}
+	return buildSnapshot(asOf, docs...), nil
 }
 
 // Poll re-reads Gamma; it is the only REST price source.
@@ -97,11 +124,8 @@ func (b *bookImpl) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, 
 	return out, nil
 }
 
-func (b *bookImpl) read(ctx context.Context) ([]byte, error) {
-	if b.cfg.Path != "" {
-		return os.ReadFile(b.cfg.Path)
-	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, b.cfg.URL, nil)
+func (b *bookImpl) read(ctx context.Context, url string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -132,8 +156,21 @@ type seed struct {
 	ids    []string
 }
 
-// ParseEvents builds a snapshot from a Gamma events body.
+// ParseEvents builds a snapshot from an NFL Gamma events body.
 func ParseEvents(raw []byte, asOf time.Time) (*book.Snapshot, error) {
+	return ParseSeriesEvents(raw, "nfl", asOf)
+}
+
+// ParseSeriesEvents builds a snapshot from one series' Gamma events body.
+func ParseSeriesEvents(raw []byte, sport string, asOf time.Time) (*book.Snapshot, error) {
+	events, err := decodeEvents(raw)
+	if err != nil {
+		return nil, err
+	}
+	return buildSnapshot(asOf, seriesDoc{sport: sport, events: events}), nil
+}
+
+func decodeEvents(raw []byte) ([]gEvent, error) {
 	var events []gEvent
 	if err := json.Unmarshal(raw, &events); err != nil {
 		var wrap struct {
@@ -144,22 +181,45 @@ func ParseEvents(raw []byte, asOf time.Time) (*book.Snapshot, error) {
 		}
 		events = wrap.Events
 	}
+	return events, nil
+}
+
+type seriesDoc struct {
+	sport  string
+	events []gEvent
+}
+
+func buildSnapshot(asOf time.Time, docs ...seriesDoc) *book.Snapshot {
 	skipped := map[string]int{}
 	sd := &seed{tokens: map[string]*token{}}
 	var games []model.BookGame
 	var quotes []model.Quote
-	for _, e := range events {
+	for _, doc := range docs {
+		g, q := addSeries(sd, doc, skipped)
+		games = append(games, g...)
+		quotes = append(quotes, q...)
+	}
+	sort.Strings(sd.ids)
+	return &book.Snapshot{Games: games, Quotes: quotes, AsOf: asOf, Skipped: skipped,
+		Subscription: strings.Join(sd.ids, ","), Private: sd}
+}
+
+func addSeries(sd *seed, doc seriesDoc, skipped map[string]int) ([]model.BookGame, []model.Quote) {
+	sport := doc.sport
+	var games []model.BookGame
+	var quotes []model.Quote
+	for _, e := range doc.events {
 		if e.Closed || e.Ended {
 			skipped["closed_event"]++
 			continue
 		}
-		away, home, ok := e.teams()
+		away, home, ok := e.teams(sport)
 		start := e.start()
 		if !ok || start.IsZero() {
 			skipped["unknown_team"]++
 			continue
 		}
-		g := model.BookGame{Book: Name, BookGameID: e.ID, Sport: "nfl", League: "nfl", Name: e.Title,
+		g := model.BookGame{Book: Name, BookGameID: e.ID, Sport: sport, League: sport, Name: e.Title,
 			Start: start, Away: away, Home: home, Live: e.Live}
 		n := 0
 		for _, m := range mainMarkets(e.Markets) {
@@ -180,13 +240,13 @@ func ParseEvents(raw []byte, asOf time.Time) (*book.Snapshot, error) {
 			games = append(games, g)
 		}
 	}
-	sort.Strings(sd.ids)
-	return &book.Snapshot{Games: games, Quotes: quotes, AsOf: asOf, Skipped: skipped,
-		Subscription: strings.Join(sd.ids, ","), Private: sd}, nil
+	return games, quotes
 }
 
-// mainMarkets keeps the moneyline and the most liquid full-game spread and
-// total; every other line is an alternate.
+// mainMarkets keeps the moneyline and, for spread and total, the most
+// balanced line: the one whose price is closest to 50/50, as a sportsbook's
+// main line is. Volume is only a tiebreak; it accumulates on the opening line
+// and points at a stale line once a game is under way.
 func mainMarkets(ms []gMarket) []gMarket {
 	var out []gMarket
 	best := map[string]int{}
@@ -198,7 +258,12 @@ func mainMarkets(ms []gMarket) []gMarket {
 		case typeMoneyline:
 			out = append(out, m)
 		case typeSpreads, typeTotals:
-			if j, ok := best[m.SportsMarketType]; !ok || m.weight() > ms[j].weight() {
+			if m.imbalance() > 0.5 {
+				continue // no live book
+			}
+			j, ok := best[m.SportsMarketType]
+			if !ok || m.imbalance() < ms[j].imbalance()-1e-9 ||
+				(m.imbalance() < ms[j].imbalance()+1e-9 && m.weight() > ms[j].weight()) {
 				best[m.SportsMarketType] = i
 			}
 		}
@@ -219,12 +284,12 @@ func marketQuotes(g model.BookGame, m gMarket, live bool) ([]model.Quote, bool) 
 	}
 	out := make([]model.Quote, 0, 2)
 	for i := range 2 {
-		p, ok := m.prob(i)
+		p, executable, ok := m.prob(i)
 		if !ok {
 			return nil, false
 		}
 		q := model.Quote{Book: Name, BookGameID: g.BookGameID, BookMarketID: m.ID, BookSelectionKey: tokens[i],
-			Sport: "nfl", League: "nfl", Period: model.PeriodFull, Subject: "event",
+			Sport: g.Sport, League: g.Sport, Period: model.PeriodFull, Subject: "event",
 			MarketName: m.Question, SelectionName: names[i]}
 		switch m.SportsMarketType {
 		case typeMoneyline, typeSpreads:
@@ -263,7 +328,7 @@ func marketQuotes(g model.BookGame, m gMarket, live bool) ([]model.Quote, bool) 
 		}
 		am, dec := convert(p)
 		status := model.StatusOpen
-		if am == 0 {
+		if am == 0 || !executable {
 			status = model.StatusSuspended
 		}
 		q.Price = model.Price{American: am, Decimal: dec, Status: status, InPlay: live}
@@ -274,7 +339,7 @@ func marketQuotes(g model.BookGame, m gMarket, live bool) ([]model.Quote, bool) 
 
 // sideTeam maps an outcome name ("Seahawks") to one of the game's teams.
 func sideTeam(name string, g model.BookGame) (string, bool) {
-	t, ok := teams.Resolve("nfl", name)
+	t, ok := teams.Resolve(g.Sport, name)
 	if !ok || (t.ID != g.Home.ID && t.ID != g.Away.ID) {
 		return "", false
 	}
@@ -327,7 +392,7 @@ func (e gEvent) start() time.Time {
 	return time.Time{}
 }
 
-func (e gEvent) teams() (away, home model.Team, ok bool) {
+func (e gEvent) teams(sport string) (away, home model.Team, ok bool) {
 	var a, h string
 	for _, t := range e.Teams {
 		switch strings.ToLower(t.Ordering) {
@@ -342,8 +407,8 @@ func (e gEvent) teams() (away, home model.Team, ok bool) {
 			a, h = parts[0], parts[1]
 		}
 	}
-	away, okA := teams.Resolve("nfl", a)
-	home, okH := teams.Resolve("nfl", h)
+	away, okA := teams.Resolve(sport, a)
+	home, okH := teams.Resolve(sport, h)
 	return away, home, okA && okH && away.ID != home.ID
 }
 
@@ -377,6 +442,14 @@ type gMarket struct {
 	Liquidity        flexFloat `json:"liquidity"`
 }
 
+// imbalance is |mid - 0.5| of the first token, or 1 without a live book.
+func (m gMarket) imbalance() float64 {
+	if m.BestBid == nil || m.BestAsk == nil || *m.BestBid <= 0 || *m.BestAsk <= 0 || *m.BestAsk > 1 {
+		return 1
+	}
+	return math.Abs((*m.BestBid+*m.BestAsk)/2 - 0.5)
+}
+
 func (m gMarket) weight() float64 {
 	if m.Volume > 0 {
 		return float64(m.Volume)
@@ -384,22 +457,23 @@ func (m gMarket) weight() float64 {
 	return float64(m.Liquidity)
 }
 
-// prob is the top-of-book mid when there is one, else Gamma's outcome price.
-// bestBid/bestAsk are for the first token; the second is the complement.
-func (m gMarket) prob(i int) (float64, bool) {
+// prob is the cost of buying outcome i now. Gamma's bestBid/bestAsk belong
+// to the first token, so buying the second costs 1 - bestBid. Without a book
+// it falls back to Gamma's last outcome price, which is not executable, so
+// executable is false and the quote shows as suspended (never best).
+func (m gMarket) prob(i int) (p float64, executable, ok bool) {
 	if m.BestBid != nil && m.BestAsk != nil && *m.BestBid > 0 && *m.BestAsk > 0 && *m.BestAsk <= 1 {
-		mid := (*m.BestBid + *m.BestAsk) / 2
-		if i == 1 {
-			mid = 1 - mid
+		if i == 0 {
+			return *m.BestAsk, true, true
 		}
-		return mid, true
+		return 1 - *m.BestBid, true, true
 	}
 	ps, err := stringArray(m.OutcomePrices)
 	if err != nil || i >= len(ps) {
-		return 0, false
+		return 0, false, false
 	}
-	p, err := strconv.ParseFloat(ps[i], 64)
-	return p, err == nil
+	p, err = strconv.ParseFloat(ps[i], 64)
+	return p, false, err == nil
 }
 
 func stringArray(raw string) ([]string, error) {

@@ -317,3 +317,19 @@ func TestResyncPollsWhileRateLimited(t *testing.T) {
 		t.Fatal("no polls while waiting out the snapshot rate limit")
 	}
 }
+
+func TestPauseGoesStaleThenRecovers(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{liveUntilCancel("a")}}
+	cfg := testConfig()
+	cfg.StaleAfter = 100 * time.Millisecond
+	s, stop := run(t, pollingBook{fb}, newSink(), cfg)
+	defer stop()
+	eventually(t, "live", func() bool { return s.Health().State == board.HealthLive })
+	polls := fb.polls.Load()
+	s.Pause(400 * time.Millisecond)
+	eventually(t, "stale while paused", func() bool { return s.Health().State == board.HealthStale })
+	if fb.polls.Load() != polls {
+		t.Fatal("polled while paused")
+	}
+	eventually(t, "live after pause", func() bool { return s.Health().State == board.HealthLive })
+}

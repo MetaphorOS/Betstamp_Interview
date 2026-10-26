@@ -29,7 +29,7 @@ const (
 	// DefaultAK is FanDuel's public frontend application key (not a
 	// credential). It can rotate; FD_AK overrides it.
 	DefaultAK        = "FhMFpcPWXMeyZxOx"
-	DefaultURL       = "https://sbapi.on.sportsbook.fanduel.ca/api/content-managed-page?page=CUSTOM&customPageId=nfl&includePrices=true&_ak=" + DefaultAK
+	PageURL          = "https://sbapi.on.sportsbook.fanduel.ca/api/content-managed-page?page=CUSTOM&includePrices=true&_ak=" + DefaultAK + "&customPageId="
 	DefaultInPlayURL = "https://sbapi.on.sportsbook.fanduel.ca/api/in-play?_ak=" + DefaultAK + "&includeTabs=true"
 	DefaultSMPURL    = "https://smp.on.sportsbook.fanduel.ca/api/sports/fixedodds/readonly/v1/getMarketPrices?priceHistory=0"
 	DefaultWSURL     = "wss://pir.on.sportsbook.fanduel.ca/graphql/realtime"
@@ -38,13 +38,45 @@ const (
 	// DefaultUA: SMP answers HTTP 500 with an empty body to Go's default UA.
 	DefaultUA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36"
 
-	americanFootballTypeID = "6423"
-	smpBatch               = 70
+	smpBatch = 70
 )
+
+// League is one FD league: its discovery page and how to recognise its
+// events on the multi-sport in-play board.
+type League struct {
+	Sport         string
+	PageID        string // content-managed-page customPageId
+	EventTypeID   string // FD sport id
+	CompetitionID string // required when set: basketball type 7522 also covers simulated games
+}
+
+// DefaultLeagues: NFL and NBA.
+var DefaultLeagues = []League{
+	{Sport: "nfl", PageID: "nfl", EventTypeID: "6423"},
+	{Sport: "nba", PageID: "nba", EventTypeID: "7522", CompetitionID: "10547864"},
+}
+
+// sportOf classifies an event. Events without type info (trimmed fixtures)
+// belong to the first league.
+func sportOf(leagues []League, e fdEvent) (string, bool) {
+	if e.EventTypeID == "" {
+		return leagues[0].Sport, true
+	}
+	for _, l := range leagues {
+		if e.EventTypeID.String() != l.EventTypeID {
+			continue
+		}
+		if l.CompetitionID != "" && e.CompetitionID != "" && e.CompetitionID.String() != l.CompetitionID {
+			continue
+		}
+		return l.Sport, true
+	}
+	return "", false
+}
 
 // Config is owned by this package.
 type Config struct {
-	URL        string // discovery board (NFL content-managed page)
+	Leagues    []League
 	InPlayURL  string // live board, merged into discovery; "-" disables
 	Path       string // read one board from a file instead of the network (tests)
 	SMPURL     string
@@ -66,8 +98,8 @@ func New(cfg Config) (book.Book, error) {
 	if cfg.APIKey == "" {
 		cfg.APIKey = os.Getenv("FD_AK")
 	}
-	if cfg.URL == "" && cfg.Path == "" {
-		cfg.URL = DefaultURL
+	if len(cfg.Leagues) == 0 {
+		cfg.Leagues = DefaultLeagues
 	}
 	if cfg.InPlayURL == "" && cfg.Path == "" {
 		cfg.InPlayURL = DefaultInPlayURL
@@ -119,7 +151,7 @@ func (b *bookImpl) ak() string {
 	return DefaultAK
 }
 
-// Snapshot reads the NFL discovery board and merges the live board, so games
+// Snapshot reads every league's discovery board and merges the live board, so games
 // that have kicked off (and dropped off discovery) are present. Both boards
 // are CDN-cached (max-age=30, stale-while-revalidate=60), so they supply
 // structure only: prices are then re-read from SMP, which is no-cache.
@@ -134,13 +166,17 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 		if err := json.Unmarshal(raw, &board); err != nil {
 			return nil, fmt.Errorf("fanduel: decode board: %w", err)
 		}
-		return buildSnapshot(asOf, board)
+		return buildSnapshot(asOf, b.cfg.Leagues, board)
 	}
-	main, err := b.getBoard(ctx, withAK(b.cfg.URL, b.ak()))
-	if err != nil {
-		return nil, err
+	var boards []fdBoard
+	for _, l := range b.cfg.Leagues {
+		board, err := b.getBoard(ctx, withAK(PageURL+l.PageID, b.ak()))
+		if err != nil {
+			// All leagues or none: a missing board would look like ended games.
+			return nil, fmt.Errorf("fanduel: %s board: %w", l.Sport, err)
+		}
+		boards = append(boards, *board)
 	}
-	boards := []fdBoard{*main}
 	if b.cfg.InPlayURL != "" && b.cfg.InPlayURL != "-" {
 		live, err := b.getBoard(ctx, withAK(b.cfg.InPlayURL, b.ak()))
 		if err != nil {
@@ -149,7 +185,7 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 		}
 		boards = append(boards, *live)
 	}
-	snap, err := buildSnapshot(asOf, boards...)
+	snap, err := buildSnapshot(asOf, b.cfg.Leagues, boards...)
 	if err != nil {
 		return nil, err
 	}
@@ -270,10 +306,23 @@ func ParseBoards(asOf time.Time, raws ...[]byte) (*book.Snapshot, error) {
 		}
 		boards = append(boards, b)
 	}
-	return buildSnapshot(asOf, boards...)
+	return buildSnapshot(asOf, DefaultLeagues, boards...)
 }
 
-func buildSnapshot(asOf time.Time, boards ...fdBoard) (*book.Snapshot, error) {
+// ParseLeagueBoards is ParseBoards for a given league set.
+func ParseLeagueBoards(asOf time.Time, leagues []League, raws ...[]byte) (*book.Snapshot, error) {
+	boards := make([]fdBoard, 0, len(raws))
+	for _, raw := range raws {
+		var b fdBoard
+		if err := json.Unmarshal(raw, &b); err != nil {
+			return nil, fmt.Errorf("fanduel: decode board: %w", err)
+		}
+		boards = append(boards, b)
+	}
+	return buildSnapshot(asOf, leagues, boards...)
+}
+
+func buildSnapshot(asOf time.Time, leagues []League, boards ...fdBoard) (*book.Snapshot, error) {
 	skipped := map[string]int{}
 	rawEvents := map[string]fdEvent{}
 	rawMarkets := map[string]fdMarket{}
@@ -312,14 +361,15 @@ func buildSnapshot(asOf time.Time, boards ...fdBoard) (*book.Snapshot, error) {
 			skipped["unknown_event"]++
 			continue
 		}
-		if e.EventTypeID != "" && e.EventTypeID.String() != americanFootballTypeID {
+		sport, ok := sportOf(leagues, e)
+		if !ok {
 			skipped["other_sport"]++
 			continue
 		}
 		ev, ok := resolved[m.EventID.String()]
 		if !ok {
 			var good bool
-			ev, good = resolveEvent(e, m)
+			ev, good = resolveEvent(sport, e, m)
 			if !good {
 				skipped["unknown_team"]++
 				continue
@@ -350,7 +400,7 @@ func buildSnapshot(asOf time.Time, boards ...fdBoard) (*book.Snapshot, error) {
 	games := make([]model.BookGame, 0, len(resolved))
 	for id, ev := range resolved {
 		games = append(games, model.BookGame{
-			Book: Name, BookGameID: id, Sport: "nfl", League: "nfl",
+			Book: Name, BookGameID: id, Sport: ev.sport, League: ev.sport,
 			Name: ev.event.Name, Start: ev.start, Away: ev.away, Home: ev.home,
 			Live: live[id], Status: ev.event.Status,
 		})
@@ -363,7 +413,7 @@ func buildSnapshot(asOf time.Time, boards ...fdBoard) (*book.Snapshot, error) {
 	}, nil
 }
 
-func resolveEvent(e fdEvent, m fdMarket) (fdEventResolved, bool) {
+func resolveEvent(sport string, e fdEvent, m fdMarket) (fdEventResolved, bool) {
 	start, err := time.Parse(time.RFC3339, e.OpenDate)
 	if err != nil {
 		return fdEventResolved{}, false
@@ -373,7 +423,7 @@ func resolveEvent(e fdEvent, m fdMarket) (fdEventResolved, bool) {
 		if r.Result == nil {
 			continue
 		}
-		t, ok := teams.Resolve("nfl", stripLine(r.RunnerName))
+		t, ok := teams.Resolve(sport, stripLine(r.RunnerName))
 		if !ok {
 			continue
 		}
@@ -387,10 +437,10 @@ func resolveEvent(e fdEvent, m fdMarket) (fdEventResolved, bool) {
 	if home.ID == "" || away.ID == "" {
 		// Totals runners are Over/Under; take the teams from "Away @ Home".
 		if parts := strings.SplitN(e.Name, " @ ", 2); len(parts) == 2 {
-			if t, ok := teams.Resolve("nfl", strings.TrimSpace(parts[0])); ok {
+			if t, ok := teams.Resolve(sport, strings.TrimSpace(parts[0])); ok {
 				away = t
 			}
-			if t, ok := teams.Resolve("nfl", strings.TrimSpace(parts[1])); ok {
+			if t, ok := teams.Resolve(sport, strings.TrimSpace(parts[1])); ok {
 				home = t
 			}
 		}
@@ -398,7 +448,7 @@ func resolveEvent(e fdEvent, m fdMarket) (fdEventResolved, bool) {
 	if home.ID == "" || away.ID == "" || home.ID == away.ID {
 		return fdEventResolved{}, false
 	}
-	return fdEventResolved{event: e, away: away, home: home, start: start.UTC()}, true
+	return fdEventResolved{event: e, away: away, home: home, start: start.UTC(), sport: sport}, true
 }
 
 // stripLine drops a trailing signed line from a spread runner name.
@@ -454,7 +504,7 @@ func makeQuote(ev fdEventResolved, m fdMarket, r fdRunner, c mainClass) (model.Q
 	q := model.Quote{
 		Book: Name, BookGameID: ev.event.EventID.String(),
 		BookMarketID: m.MarketID, BookSelectionKey: m.MarketID + ":" + r.SelectionID.String(),
-		Sport: "nfl", League: "nfl", Family: c.family, Period: model.PeriodFull,
+		Sport: ev.sport, League: ev.sport, Family: c.family, Period: model.PeriodFull,
 		Subject: "event", Stat: c.stat, Comparator: c.comparator, Line: model.CopyLine(r.Handicap),
 		MarketName: m.MarketName, SelectionName: r.RunnerName,
 		Price: model.Price{American: int(*am), Decimal: dec, Status: fdStatus(m.MarketStatus, r.RunnerStatus), InPlay: m.IsInPlay()},
@@ -531,13 +581,15 @@ type fdBoard struct {
 	} `json:"attachments"`
 }
 type fdEvent struct {
-	EventID     ID     `json:"eventId"`
-	EventTypeID ID     `json:"eventTypeId"`
-	Name        string `json:"name"`
-	OpenDate    string `json:"openDate"`
-	Status      string `json:"status"`
+	EventID       ID     `json:"eventId"`
+	EventTypeID   ID     `json:"eventTypeId"`
+	CompetitionID ID     `json:"competitionId"`
+	Name          string `json:"name"`
+	OpenDate      string `json:"openDate"`
+	Status        string `json:"status"`
 }
 type fdEventResolved struct {
+	sport string
 	event fdEvent
 	away  model.Team
 	home  model.Team
