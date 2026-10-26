@@ -59,6 +59,7 @@ const am = (v) => (v > 0 ? `+${v}` : `${v}`);
 // price renders in the chosen format; decimal uses the precise value when the
 // book sends one (DK/FD true odds) and converts otherwise.
 function price(american, decimal) {
+  if (!american && !(decimal > 1)) return "—"; // no price (e.g. an empty order book)
   if (state.format === "decimal") return (decimal > 1 ? decimal : dec(american)).toFixed(2);
   return am(american);
 }
@@ -189,8 +190,12 @@ function onDelta(d) {
     return;
   }
   if (d.k === "game") {
-    if (d.rm) state.games.delete(d.g);
-    else state.games.set(d.g, d.game);
+    if (d.rm) {
+      // The server dropped every slot of a removed game; so do we, or a
+      // revived game would show its old prices next to the new one.
+      state.games.delete(d.g);
+      for (const key of [...state.slots.keys()]) if (gameOf(key) === d.g) dropSlot(key);
+    } else state.games.set(d.g, d.game);
     renderModes();
     fullRender = true;
     schedule();
@@ -209,7 +214,11 @@ function onDelta(d) {
     else if (d.e) sl.entries[d.b] = d.e;
   }
   sl.best = d.best || null;
-  if (d.src === "stream" && d.b && d.recv && d.e && state.bclock) {
+  if (!Object.keys(sl.entries).length) dropSlot(key);
+  // A frame encoded more than 2 s ago is backlog replayed after a reconnect,
+  // not a fresh delivery: counting it would inflate latency by the outage.
+  const replayed = d.now && serverNow() - d.now > 2000;
+  if (d.src === "stream" && d.b && d.recv && d.e && state.bclock && !replayed) {
     // Hops, all in server time. Nothing is recorded until the browser clock
     // is estimated from pings; book clocks are compared only against a valid
     // NTP-corrected server clock, so uncorrected samples never mix in.
@@ -232,6 +241,10 @@ function onDelta(d) {
 // A slot key is gameId|identity; the game id has "|" in it and the identity
 // has exactly 7 fields.
 const gameOf = (key) => key.split("|").slice(0, -7).join("|");
+function dropSlot(key) {
+  state.slots.delete(key);
+  for (const k of [...shown.keys()]) if (k.startsWith(key + "|")) shown.delete(k);
+}
 function push(arr, v) {
   arr.push(v);
   if (arr.length > 300) arr.shift();
@@ -303,7 +316,9 @@ function isLive(g) {
   return false;
 }
 function hasPrices(g) {
-  for (const key of state.slots.keys()) if (key.startsWith(g.id + "|")) return true;
+  for (const [key, sl] of state.slots) {
+    if (key.startsWith(g.id + "|") && Object.keys(sl.entries).length) return true;
+  }
   return false;
 }
 

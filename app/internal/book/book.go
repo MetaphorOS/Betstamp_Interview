@@ -92,6 +92,10 @@ type Tuner interface{ Tuning() Tuning }
 // takes a fresh snapshot and restarts the stream from it.
 var ErrResync = errors.New("book: resync required")
 
+// ErrSkipped is returned by Poll when the book chose not to fetch (its own
+// rate limit). The supervisor counts it as neither data nor a failure.
+var ErrSkipped = errors.New("book: poll skipped")
+
 // ErrAuth means the push channel rejected our credentials. Books that derive
 // credentials from a rotating source refresh it before the next connect.
 var ErrAuth = errors.New("book: auth rejected")

@@ -180,8 +180,10 @@ func (c *core) gameStatus(gs *gameState, now time.Time) string {
 	open := false
 	for key := range gs.keys {
 		if s := c.slots[key]; s != nil {
-			for _, e := range s.entries {
-				if e.Status == model.StatusOpen {
+			for name, e := range s.entries {
+				// A stale or down book's open price is not evidence the game
+				// is still on: it would hold a finished game open forever.
+				if e.Status == model.StatusOpen && !c.health[name].excluded() {
 					open = true
 					break
 				}
@@ -245,6 +247,11 @@ func (c *core) refreshGame(gid string, now time.Time) {
 // suspended -> closed -> pruned.
 func (c *core) tick(now time.Time) {
 	c.flushConfirms(now)
+	for k, at := range c.removed {
+		if now.Sub(at) > removedKeep {
+			delete(c.removed, k)
+		}
+	}
 	ids := make([]string, 0, len(c.games))
 	for id := range c.games {
 		ids = append(ids, id)
@@ -291,6 +298,7 @@ type core struct {
 	health     map[string]Health
 	latency    map[string]*splitWindow
 	confirmed  map[string]map[string]time.Time // book -> slot key -> confirmed at, since the last tick
+	removed    map[string]time.Time            // book|slot key -> when the book's entry was removed
 	dropped    map[string]int
 	healthSent map[string]time.Time
 	seq        uint64
@@ -310,6 +318,7 @@ func newCore(books []book.Descriptor, now func() time.Time, opts Options) *core 
 		gameRefs: map[string]map[string]string{}, games: map[string]*gameState{},
 		slots: map[string]*slot{}, health: map[string]Health{}, latency: map[string]*splitWindow{}, confirmed: map[string]map[string]time.Time{},
 		dropped: map[string]int{}, subs: map[int]chan Delta{}, healthSent: map[string]time.Time{},
+		removed: map[string]time.Time{},
 	}
 	for _, d := range books {
 		c.kind[d.Name] = d.PriceKind
@@ -318,6 +327,10 @@ func newCore(books []book.Descriptor, now func() time.Time, opts Options) *core 
 	}
 	return c
 }
+
+// removedKeep is how long a removal is remembered: longer than any REST
+// request (poll or multi-request snapshot) can be in flight.
+const removedKeep = 10 * time.Minute
 
 // MatchTolerance is how far apart two books' start times may be for one game.
 const MatchTolerance = 3 * time.Hour
@@ -423,7 +436,7 @@ func (c *core) applySnapshot(name string, snap *book.Snapshot) {
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		c.removeEntry(c.slots[key], name, Delta{AppliedAt: recv})
+		c.removeEntry(c.slots[key], name, Delta{AppliedAt: recv}, snap.AsOf)
 	}
 }
 
@@ -435,6 +448,12 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	}
 	p, ok := isMain(u.Identity)
 	if !ok {
+		return
+	}
+	key := gid + "|" + u.Identity
+	// A poll or snapshot requested before the book removed this entry must
+	// not bring it back: the entry is gone, so its timestamp cannot guard.
+	if at, ok := c.removed[u.Book+"|"+key]; ok && u.Source != model.SourceStream && !u.AsOf.After(at) {
 		return
 	}
 	gs := c.games[gid]
@@ -451,7 +470,6 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	if lw := c.latency[u.Book]; lw != nil && u.Source == model.SourceStream {
 		lw.add(appliedAt.Sub(u.RecvAt), u.RecvAt, u.BookTS, u.InPlay)
 	}
-	key := gid + "|" + u.Identity
 	s := c.slots[key]
 	if s == nil {
 		if u.Status == model.StatusRemoved {
@@ -468,10 +486,15 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	base := Delta{Source: u.Source, RecvAt: u.RecvAt, BookTS: u.BookTS, AppliedAt: appliedAt}
 	if u.Status == model.StatusRemoved {
 		if had {
-			c.removeEntry(s, u.Book, base)
+			at := u.AsOf
+			if u.Source == model.SourceStream {
+				at = u.RecvAt
+			}
+			c.removeEntry(s, u.Book, base, at)
 		}
 		return
 	}
+	delete(c.removed, u.Book+"|"+key)
 	e := Entry{
 		Line: model.CopyLine(u.Line), American: u.American, Decimal: u.Decimal,
 		Status: u.Status, InPlay: u.InPlay, UpdatedAt: u.RecvAt, BookTS: u.BookTS,
@@ -479,18 +502,24 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	appeared := false
 	if had {
 		e.Prev = old.Prev
-		if model.LineString(old.Line) != model.LineString(e.Line) || old.American != e.American {
+		// American 0 is "no price" (an empty order book), not a price to show as previous.
+		if old.American != 0 && (model.LineString(old.Line) != model.LineString(e.Line) || old.American != e.American) {
 			e.Prev = &Prev{Line: model.CopyLine(old.Line), American: old.American}
 		}
 		if !visibleChange(old, e) {
 			// Same price: refresh freshness silently.
 			if e.UpdatedAt.After(old.UpdatedAt) {
-				old.UpdatedAt, old.BookTS, old.Decimal = e.UpdatedAt, e.BookTS, e.Decimal
+				old.UpdatedAt, old.BookTS = e.UpdatedAt, e.BookTS
 				s.entries[u.Book] = old
 				if c.confirmed[u.Book] == nil {
 					c.confirmed[u.Book] = map[string]time.Time{}
 				}
 				c.confirmed[u.Book][key] = e.UpdatedAt
+				// Recency breaks exact ties, so a confirmation can move best.
+				if nb := c.pickBest(s); !sameBest(nb, s.best) {
+					s.best = nb
+					c.publish(Delta{Kind: KindSlot, GameID: gid, Identity: u.Identity, Best: copyBest(nb), AppliedAt: appliedAt})
+				}
 			}
 			return
 		}
@@ -524,12 +553,18 @@ func (c *core) apply(u model.Update, appliedAt time.Time) {
 	}
 }
 
+// visibleChange: anything the page shows or best price compares, except
+// recency. A decimal-only move (Polymarket, or a book's true odds) can change
+// the winner without changing the American price.
 func visibleChange(a, b Entry) bool {
 	return model.LineString(a.Line) != model.LineString(b.Line) || a.American != b.American ||
-		a.Status != b.Status || a.InPlay != b.InPlay
+		a.Decimal != b.Decimal || a.Status != b.Status || a.InPlay != b.InPlay
 }
 
-func (c *core) removeEntry(s *slot, name string, base Delta) {
+// removeEntry deletes a book's entry; at is the time the removal is known
+// true, which older polls and snapshots may not undo.
+func (c *core) removeEntry(s *slot, name string, base Delta, at time.Time) {
+	c.removed[name+"|"+s.gameID+"|"+s.identity] = at
 	delete(s.entries, name)
 	s.best = c.pickBest(s)
 	base.Kind, base.GameID, base.Identity, base.Book, base.Removed, base.Best = KindSlot, s.gameID, s.identity, name, true, copyBest(s.best)

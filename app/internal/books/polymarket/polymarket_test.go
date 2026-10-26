@@ -151,3 +151,38 @@ func TestStreamUsesLatestLiveFlag(t *testing.T) {
 		t.Fatalf("after kickoff: %+v %v", ups, err)
 	}
 }
+
+// An empty ask side means nothing can be bought: the last price must stop
+// competing at once (F3). Asks without bids are still buyable.
+func TestEmptyAsksSuspendAndAskOnlyPrices(t *testing.T) {
+	sd, _, _, _ := loadSeed(t)
+	tok := sd.ids[0]
+	apply := func(f any) []model.Update {
+		t.Helper()
+		raw, _ := json.Marshal(f)
+		ups, err := sd.apply(raw, time.Now(), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ups
+	}
+	ups := apply(map[string]any{"event_type": "book", "asset_id": tok,
+		"bids": []any{map[string]any{"price": "0.55"}}, "asks": []any{}})
+	if len(ups) != 1 || ups[0].Status != model.StatusSuspended || ups[0].American != 0 {
+		t.Fatalf("empty asks: %+v, want one suspended update with no price", ups)
+	}
+	ups = apply([]any{map[string]any{"event_type": "price_change", "price_changes": []any{
+		map[string]any{"asset_id": tok, "best_bid": "0", "best_ask": "0.62"}}}})
+	if len(ups) != 1 || ups[0].Status != model.StatusOpen || ups[0].American != -163 {
+		t.Fatalf("ask-only: %+v, want open at -163", ups)
+	}
+	ups = apply(map[string]any{"event_type": "best_bid_ask", "asset_id": tok, "best_bid": "0.70", "best_ask": "0.62"})
+	if len(ups) != 1 || ups[0].Status != model.StatusSuspended {
+		t.Fatalf("crossed book: %+v, want suspended", ups)
+	}
+	ups = apply([]any{map[string]any{"event_type": "price_change", "price_changes": []any{
+		map[string]any{"asset_id": tok, "best_bid": "0.60"}}}})
+	if len(ups) != 0 {
+		t.Fatalf("a message without an ask field is not news: %+v", ups)
+	}
+}

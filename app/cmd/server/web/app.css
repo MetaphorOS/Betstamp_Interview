@@ -174,7 +174,7 @@ td.team small { display: block; font-weight: 400; color: var(--muted); font-size
 .game.is-closed { opacity: 0.55; }
 .section-title .hint { text-transform: none; letter-spacing: 0; font-size: 11px; margin-left: 6px; }
 
-/* price not confirmed for 5+ minutes */
+/* price not confirmed for 3+ minutes */
 .cell .old-icon { display: none; position: absolute; top: 3px; right: 5px; font-size: 11px; line-height: 1; color: var(--warn); cursor: help; }
 .cell.old .old-icon { display: block; }
 

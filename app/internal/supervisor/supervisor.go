@@ -187,11 +187,12 @@ func (s *Supervisor) Run(ctx context.Context) {
 		}
 		snap := next
 		next = nil
+		reused := false
 		if snap == nil && !needFresh && s.seed != nil && !s.snapshotAllowed() {
 			// The rate limit forbids a new snapshot yet: reconnect from the
 			// last one. The post-connect reconcile covers the gap.
 			s.log.Info("reconnecting from the last snapshot", "age", time.Since(s.seed.AsOf).Round(time.Second))
-			snap = s.seed
+			snap, reused = s.seed, true
 		}
 		needFresh = false
 		if snap == nil {
@@ -212,7 +213,10 @@ func (s *Supervisor) Run(ctx context.Context) {
 		if err := s.sink.ApplySnapshot(ctx, s.name, snap); err != nil {
 			return
 		}
-		s.markData()
+		if !reused {
+			// A reused seed is old data: it must not make the book look fresh.
+			s.markData()
+		}
 
 		connectedAt, err := s.runStream(ctx, snap)
 		s.setConnected(false)
@@ -276,33 +280,31 @@ func (s *Supervisor) delay(backoff time.Duration, err error) time.Duration {
 // wait sleeps for d, polling every PollEvery when the book can poll, so
 // prices stay fresh while the stream is down.
 func (s *Supervisor) wait(ctx context.Context, d time.Duration, seed *book.Snapshot) {
-	deadline := time.NewTimer(d)
-	defer deadline.Stop()
+	// Polls made during the wait share its deadline: a slow or hung REST call
+	// can never stretch a backoff (and so delay a reconnect) past d.
+	wctx, cancel := context.WithTimeout(ctx, d)
+	defer cancel()
 	p, canPoll := s.b.(book.Poller)
 	if !canPoll || seed == nil {
-		select {
-		case <-ctx.Done():
-		case <-deadline.C:
-		}
+		<-wctx.Done()
 		return
 	}
-	s.poll(ctx, p, seed)
+	s.poll(wctx, p, seed)
 	tick := time.NewTicker(s.cfg.PollEvery)
 	defer tick.Stop()
 	for {
 		select {
-		case <-ctx.Done():
-			return
-		case <-deadline.C:
+		case <-wctx.Done():
 			return
 		case <-tick.C:
-			s.poll(ctx, p, seed)
+			s.poll(wctx, p, seed)
 		}
 	}
 }
 
-// snapshot respects MinSnapshotGap and recovers panics.
-func (s *Supervisor) snapshot(ctx context.Context) (snap *book.Snapshot, err error) {
+// snapshot waits out MinSnapshotGap (polling meanwhile), then takes one.
+// Only the Run goroutine calls it: it reads the Run-owned seed.
+func (s *Supervisor) snapshot(ctx context.Context) (*book.Snapshot, error) {
 	s.mu.Lock()
 	gap := s.cfg.MinSnapshotGap - time.Since(s.lastSnapshotAt)
 	s.mu.Unlock()
@@ -313,6 +315,12 @@ func (s *Supervisor) snapshot(ctx context.Context) (snap *book.Snapshot, err err
 			return nil, ctx.Err()
 		}
 	}
+	return s.snapshotNow(ctx)
+}
+
+// snapshotNow takes a snapshot immediately and recovers panics. Background
+// jobs call it after checking the rate limit themselves.
+func (s *Supervisor) snapshotNow(ctx context.Context) (snap *book.Snapshot, err error) {
 	s.mu.Lock()
 	s.lastSnapshotAt = time.Now()
 	s.mu.Unlock()
@@ -360,6 +368,9 @@ func (s *Supervisor) poll(ctx context.Context, p book.Poller, seed *book.Snapsho
 		}()
 		return p.Poll(ctx, seed)
 	}()
+	if errors.Is(err, book.ErrSkipped) {
+		return // the book chose not to fetch: neither data nor a failure
+	}
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("poll failed", "error", err)
@@ -429,9 +440,51 @@ func (s *Supervisor) markData() { s.lastData.Store(time.Now().UnixNano()) }
 
 // runStream runs one Stream with its watchdog, reconcile and resnapshot
 // tickers. It returns when the stream ends.
+//
+// REST work (reconcile polls, resnapshots) runs in its own goroutine, one job
+// at a time, so this loop never waits on a slow request: the heartbeat
+// watchdog, the kill switch and the stream ending are always handled
+// promptly. Jobs use the stream's context, so stopping the stream also
+// cancels an in-flight request, and the loop waits for a job before
+// returning so two runs never overlap.
 func (s *Supervisor) runStream(ctx context.Context, snap *book.Snapshot) (connectedAt time.Time, err error) {
 	streamCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	jobDone := make(chan jobResult, 1)
+	jobRunning := false
+	// cur is the newest good snapshot. A background resnapshot with the same
+	// subscription advances it (and the reconnect seed) without a restart.
+	cur := snap
+	// A full refresh that comes due while another job runs waits here rather
+	// than being lost: polls only update prices, so finding new games and
+	// markets depends on these running.
+	pendingFull := false
+	defer func() {
+		cancel()
+		if jobRunning {
+			<-jobDone
+		}
+	}()
+	// startJob runs fn against cur in the background unless a job is
+	// already running.
+	startJob := func(what string, fn func(context.Context, *book.Snapshot) jobResult) bool {
+		if jobRunning {
+			return false
+		}
+		jobRunning = true
+		seed := cur
+		go func() {
+			var res jobResult
+			defer func() {
+				if r := recover(); r != nil {
+					s.log.Error("panic in background job", "job", what, "panic", r, "stack", string(debug.Stack()))
+					res = jobResult{}
+				}
+				jobDone <- res
+			}()
+			res = fn(streamCtx, seed)
+		}()
+		return true
+	}
 	em := &emitter{s: s, connected: make(chan struct{})}
 	s.lastBeat.Store(time.Now().UnixNano())
 	done := make(chan error, 1)
@@ -487,52 +540,72 @@ func (s *Supervisor) runStream(ctx context.Context, snap *book.Snapshot) (connec
 			}
 		case <-afterConnect:
 			afterConnect = nil
-			if next := s.reconcile(ctx, snap); next != nil {
-				return connectedAt, stop(&restart{snap: next})
+			if !startJob("connect reconcile", s.reconcile) {
+				// Another REST job is in flight; this one matters (it covers
+				// the gap since the snapshot), so try again shortly.
+				afterConnect = time.After(time.Second)
 			}
 		case <-reconcile.C:
-			if next := s.reconcile(ctx, snap); next != nil {
-				return connectedAt, stop(&restart{snap: next})
-			}
+			startJob("reconcile", s.reconcile) // skipped if one is still running
 		case <-resnap:
-			if next := s.resnapshot(ctx, snap); next != nil {
-				return connectedAt, stop(&restart{snap: next})
+			if !startJob("resnapshot", s.resnapshot) {
+				pendingFull = true
+			}
+		case res := <-jobDone:
+			jobRunning = false
+			if res.restart {
+				return connectedAt, stop(&restart{snap: res.snap})
+			}
+			if res.snap != nil {
+				// Run owns the seed and is blocked in this call, so setting it
+				// here is safe: the next reconnect uses the newest snapshot.
+				cur, s.seed = res.snap, res.snap
+			}
+			if pendingFull {
+				pendingFull = false
+				startJob("resnapshot", s.resnapshot)
 			}
 		}
 	}
 }
 
-// reconcile polls when it can, otherwise re-snapshots. It returns a new
-// snapshot only when the subscription changed.
-func (s *Supervisor) reconcile(ctx context.Context, cur *book.Snapshot) *book.Snapshot {
+// jobResult is what a background job hands back to the stream loop.
+type jobResult struct {
+	snap    *book.Snapshot // a newer good snapshot, or nil
+	restart bool           // snap's subscription differs: restart the stream
+}
+
+// reconcile polls when it can, otherwise re-snapshots.
+func (s *Supervisor) reconcile(ctx context.Context, cur *book.Snapshot) jobResult {
 	if p, ok := s.b.(book.Poller); ok {
 		s.poll(ctx, p, cur)
-		return nil
+		return jobResult{}
 	}
 	return s.resnapshot(ctx, cur)
 }
 
-func (s *Supervisor) resnapshot(ctx context.Context, cur *book.Snapshot) *book.Snapshot {
+func (s *Supervisor) resnapshot(ctx context.Context, cur *book.Snapshot) jobResult {
 	s.mu.Lock()
 	tooSoon := time.Since(s.lastSnapshotAt) < s.cfg.MinSnapshotGap
 	s.mu.Unlock()
 	if tooSoon {
-		return nil
+		return jobResult{}
 	}
-	snap, err := s.snapshot(ctx)
+	snap, err := s.snapshotNow(ctx)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("reconcile snapshot failed", "error", err)
 		}
-		return nil
+		return jobResult{}
 	}
 	if snap.Subscription != cur.Subscription {
-		return snap
+		return jobResult{snap: snap, restart: true}
 	}
-	if err := s.sink.ApplySnapshot(ctx, s.name, snap); err == nil {
-		s.markData()
+	if err := s.sink.ApplySnapshot(ctx, s.name, snap); err != nil {
+		return jobResult{}
 	}
-	return nil
+	s.markData()
+	return jobResult{snap: snap}
 }
 
 func (s *Supervisor) setConnected(v bool) {

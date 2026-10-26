@@ -427,3 +427,100 @@ func TestLatencySplitsPregameAndLive(t *testing.T) {
 		t.Fatalf("pregame %v live %v", l.Pregame.BookP50ms, l.Live.BookP50ms)
 	}
 }
+
+// A poll requested before the stream removed an entry must not bring it
+// back once the entry is gone (F1); a newer poll may.
+func TestStalePollCannotReviveRemovedEntry(t *testing.T) {
+	c := newTestCore()
+	id := ml("nfl-vikings")
+	key := slotKey(c, "dk", "dk-g", id)
+	c.apply(upd("dk", "dk-g", id, nil, 150, t0), t0)
+	rm := upd("dk", "dk-g", id, nil, 0, t0.Add(2*time.Second))
+	rm.Status = model.StatusRemoved
+	c.apply(rm, t0.Add(2*time.Second))
+	poll := upd("dk", "dk-g", id, nil, 150, t0.Add(3*time.Second))
+	poll.Source, poll.AsOf = model.SourcePoll, t0.Add(time.Second) // sent before the removal
+	c.apply(poll, t0.Add(3*time.Second))
+	if s := c.slots[key]; s != nil {
+		t.Fatalf("stale poll revived a removed entry: %+v", s.entries)
+	}
+	// So must a snapshot (or a reused seed) taken before the removal.
+	c.applySnapshot("dk", &book.Snapshot{Games: []model.BookGame{game("dk", "dk-g")}, AsOf: t0.Add(time.Second),
+		Quotes: []model.Quote{{Book: "dk", BookGameID: "dk-g", Family: model.FamilyMoneyline, Period: model.PeriodFull,
+			Subject: "event", Outcome: "nfl-vikings", Price: model.Price{American: 150, Decimal: 2.5, Status: model.StatusOpen}}}})
+	if s := c.slots[key]; s != nil {
+		t.Fatalf("stale snapshot revived a removed entry: %+v", s.entries)
+	}
+	poll.AsOf = t0.Add(4 * time.Second)
+	c.apply(poll, t0.Add(5*time.Second))
+	if s := c.slots[key]; s == nil || s.entries["dk"].American != 150 {
+		t.Fatal("a poll sent after the removal was ignored")
+	}
+}
+
+// Best price compares precise decimals, so a decimal-only move must
+// recompute best and reach the page (F2).
+func TestDecimalOnlyChangeRecomputesBest(t *testing.T) {
+	c := newTestCore()
+	id := ml("nfl-vikings")
+	key := slotKey(c, "dk", "dk-g", id)
+	dk := upd("dk", "dk-g", id, nil, -110, t0)
+	dk.Decimal = 1.90
+	c.apply(dk, t0)
+	fd := upd("fd", "fd-g", id, nil, -110, t0)
+	fd.Decimal = 1.95
+	c.apply(fd, t0)
+	if b := c.slots[key].best; b.Book != "fd" {
+		t.Fatalf("best = %+v, want fd", b)
+	}
+	_, drain := collect(c)
+	dk.Decimal, dk.RecvAt = 2.00, t0.Add(time.Second)
+	c.apply(dk, t0.Add(time.Second))
+	if b := c.slots[key].best; b.Book != "dk" {
+		t.Fatalf("best = %+v after dk's decimal improved, want dk", b)
+	}
+	ds := drain()
+	if len(ds) != 1 || ds[0].Kind != KindSlot || ds[0].Entry == nil || ds[0].Entry.Decimal != 2.00 {
+		t.Fatalf("deltas = %+v, want one slot delta carrying the new decimal", ds)
+	}
+}
+
+// Recency breaks an exact tie, so a confirmation can move best (F2).
+func TestConfirmationCanBreakTie(t *testing.T) {
+	c := newTestCore()
+	id := ml("nfl-vikings")
+	key := slotKey(c, "dk", "dk-g", id)
+	c.apply(upd("dk", "dk-g", id, nil, -110, t0), t0)
+	c.apply(upd("fd", "fd-g", id, nil, -110, t0.Add(time.Second)), t0.Add(time.Second))
+	if b := c.slots[key].best; b.Book != "fd" {
+		t.Fatalf("best = %+v, want the more recent fd", b)
+	}
+	c.apply(upd("dk", "dk-g", id, nil, -110, t0.Add(2*time.Second)), t0.Add(2*time.Second))
+	if b := c.slots[key].best; b.Book != "dk" {
+		t.Fatalf("best = %+v after dk re-confirmed, want dk", b)
+	}
+}
+
+// A stale book's open quote must not keep a finished game open forever (F4).
+func TestStaleBookDoesNotHoldGameOpen(t *testing.T) {
+	now := t0.Add(3 * time.Hour)
+	c := newTestCore()
+	c.now = func() time.Time { return now }
+	live := upd("fd", "fd-g", ml("nfl-vikings"), nil, -5000, now)
+	live.InPlay = true
+	c.apply(live, now)
+	gid := c.gameRefs["fd"]["fd-g"]
+	c.setHealth("fd", Health{State: HealthStale})
+	c.tick(now.Add(time.Minute))
+	if st := c.games[gid].view.Status; st != GameSuspended {
+		t.Fatalf("status %q with only a stale book open, want suspended", st)
+	}
+	c.tick(now.Add(4 * time.Minute))
+	if st := c.games[gid].view.Status; st != GameClosed {
+		t.Fatalf("status %q, want closed", st)
+	}
+	c.tick(now.Add(20 * time.Minute))
+	if len(c.state().Games) != 0 {
+		t.Fatal("game held by a stale book was never pruned")
+	}
+}

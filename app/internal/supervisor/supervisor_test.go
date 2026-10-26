@@ -352,3 +352,192 @@ func TestPongRoundTripInHealth(t *testing.T) {
 		t.Fatalf("handshake %v at %v", h.HandshakeMs, h.HandshakeAt)
 	}
 }
+
+// slowPollBook's Poll is a REST call that never returns on its own: it blocks
+// until its context is cancelled.
+type slowPollBook struct {
+	*fakeBook
+	pollStarted   chan struct{}
+	once          sync.Once
+	pollCancelled atomic.Bool
+}
+
+func (b *slowPollBook) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, error) {
+	b.once.Do(func() { close(b.pollStarted) })
+	<-ctx.Done()
+	b.pollCancelled.Store(true)
+	return nil, ctx.Err()
+}
+
+// The watchdog must still fire while a reconcile is stuck in REST: the loop
+// may not wait on it. Before reconciles moved off the loop, this hung.
+func TestWatchdogFiresDuringSlowReconcile(t *testing.T) {
+	silentEnded := make(chan time.Time, 1)
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{
+		func(ctx context.Context, em book.Emitter) error {
+			em.Connected() // then silence: no frames, no pongs
+			<-ctx.Done()
+			silentEnded <- time.Now()
+			return ctx.Err()
+		},
+		liveUntilCancel("a"),
+	}}
+	sb := &slowPollBook{fakeBook: fb, pollStarted: make(chan struct{})}
+	cfg := testConfig()
+	cfg.HeartbeatTimeout = 300 * time.Millisecond
+	cfg.ConnectReconcile = 10 * time.Millisecond // the post-connect reconcile is the slow call
+	start := time.Now()
+	_, stop := run(t, sb, newSink(), cfg)
+	defer stop()
+
+	select {
+	case <-sb.pollStarted:
+	case <-time.After(3 * time.Second):
+		t.Fatal("reconcile never started")
+	}
+	select {
+	case ended := <-silentEnded:
+		if d := ended.Sub(start); d > 2*time.Second {
+			t.Fatalf("watchdog took %s with a reconcile in flight", d)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("watchdog did not fire while a reconcile was blocked in REST")
+	}
+	eventually(t, "reconnect after the timeout", func() bool { return fb.runs.Load() >= 2 })
+	if !sb.pollCancelled.Load() {
+		t.Fatal("the stuck REST call was left running after its stream stopped")
+	}
+}
+
+// gatedPollBook's first Poll blocks until release is closed.
+type gatedPollBook struct {
+	*fakeBook
+	release chan struct{}
+	once    sync.Once
+}
+
+func (b *gatedPollBook) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, error) {
+	b.polls.Add(1)
+	b.once.Do(func() {
+		select {
+		case <-b.release:
+		case <-ctx.Done():
+		}
+	})
+	return nil, nil
+}
+
+// A full refresh that comes due while a poll is running must run once the
+// poll finishes, not be dropped until the next interval: polls only update
+// prices, so new games and markets are found by full refreshes alone.
+func TestFullRefreshDueDuringPollRunsAfterIt(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{liveUntilCancel("a")}}
+	gb := &gatedPollBook{fakeBook: fb, release: make(chan struct{})}
+	cfg := testConfig()
+	cfg.ResnapshotEvery = 400 * time.Millisecond
+	_, stop := run(t, gb, newSink(), cfg)
+	defer stop()
+	eventually(t, "post-connect poll started", func() bool { return fb.polls.Load() >= 1 })
+	time.Sleep(500 * time.Millisecond) // the resnapshot tick at ~400ms finds the poll running
+	if n := fb.snapshots.Load(); n != 1 {
+		t.Fatalf("snapshots = %d before the poll finished, want 1", n)
+	}
+	close(gb.release)
+	deadline := time.Now().Add(200 * time.Millisecond) // the next tick is ~300ms away
+	for fb.snapshots.Load() < 2 {
+		if time.Now().After(deadline) {
+			t.Fatal("the full refresh that came due during the poll was dropped")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// seedBook hands out numbered snapshots with the same subscription and
+// records which one each Stream run was given.
+type seedBook struct {
+	*fakeBook
+	mu    sync.Mutex
+	made  []*book.Snapshot
+	given []*book.Snapshot
+}
+
+func (b *seedBook) Snapshot(ctx context.Context) (*book.Snapshot, error) {
+	b.snapshots.Add(1)
+	snap := &book.Snapshot{AsOf: time.Now(), Subscription: "s"}
+	b.mu.Lock()
+	b.made = append(b.made, snap)
+	b.mu.Unlock()
+	return snap, nil
+}
+
+func (b *seedBook) Stream(ctx context.Context, seed *book.Snapshot, em book.Emitter) error {
+	b.mu.Lock()
+	b.given = append(b.given, seed)
+	b.mu.Unlock()
+	return b.fakeBook.Stream(ctx, seed, em)
+}
+
+// A drop shortly after a background resnapshot must reconnect from that
+// newer snapshot, not the one the stream started with.
+func TestReconnectUsesNewestResnapshot(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{
+		liveFor("a", 550*time.Millisecond, errors.New("socket closed")),
+		liveUntilCancel("a"),
+	}}
+	sb := &seedBook{fakeBook: fb}
+	cfg := testConfig()
+	cfg.MinSnapshotGap = 400 * time.Millisecond  // the reconnect at ~570ms must reuse a seed
+	cfg.ResnapshotEvery = 450 * time.Millisecond // allowed: 450ms after the first snapshot
+	_, stop := run(t, sb, newSink(), cfg)
+	defer stop()
+	eventually(t, "second stream run", func() bool { return fb.runs.Load() >= 2 })
+	sb.mu.Lock()
+	defer sb.mu.Unlock()
+	if len(sb.made) != 2 {
+		t.Fatalf("snapshots = %d, want the first plus one resnapshot", len(sb.made))
+	}
+	if sb.given[1] != sb.made[1] {
+		t.Fatal("reconnected from the old seed instead of the newer resnapshot")
+	}
+}
+
+// Reconnecting from a reused seed is not new data: with every connect
+// failing, the book must age into stale rather than stay degraded.
+func TestSeedReuseDoesNotRefreshHealth(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{
+		func(ctx context.Context, em book.Emitter) error { return errors.New("dial refused") },
+	}}
+	cfg := testConfig()
+	cfg.MinSnapshotGap = time.Hour
+	cfg.StaleAfter = 100 * time.Millisecond
+	s, stop := run(t, fb, newSink(), cfg)
+	defer stop()
+	eventually(t, "stale", func() bool { return s.Health().State == board.HealthStale })
+	if n := fb.snapshots.Load(); n != 1 {
+		t.Fatalf("snapshots = %d, want the one seed", n)
+	}
+}
+
+type skippingPollBook struct{ *fakeBook }
+
+func (b skippingPollBook) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, error) {
+	b.polls.Add(1)
+	return nil, book.ErrSkipped
+}
+
+// A poll the book skipped is neither data nor a failure.
+func TestSkippedPollIsNotData(t *testing.T) {
+	fb := &fakeBook{name: "a", plans: []func(context.Context, book.Emitter) error{
+		func(ctx context.Context, em book.Emitter) error { return errors.New("dial refused") },
+	}}
+	cfg := testConfig()
+	cfg.MinSnapshotGap = time.Hour
+	cfg.StaleAfter = 100 * time.Millisecond
+	s, stop := run(t, skippingPollBook{fb}, newSink(), cfg)
+	defer stop()
+	eventually(t, "polls attempted", func() bool { return fb.polls.Load() >= 3 })
+	eventually(t, "stale", func() bool { return s.Health().State == board.HealthStale })
+	if h := s.Health(); h.Polls != 0 || h.PollErrors != 0 {
+		t.Fatalf("polls=%d errors=%d, want skipped polls counted as neither", h.Polls, h.PollErrors)
+	}
+}

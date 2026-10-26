@@ -38,7 +38,8 @@ and total, pregame and in-play, for the NFL (required) and the NBA (extra).
 11. [Deployment](#11-deployment)
 12. [What's next, and scaling to 10 books](#12-whats-next-and-scaling-to-10-books)
 13. [Known limitations, stated plainly](#13-known-limitations-stated-plainly)
-14. [Repository layout](#14-repository-layout)
+14. [Code review: what was found and what was done](#14-code-review-what-was-found-and-what-was-done)
+15. [Repository layout](#15-repository-layout)
 
 ---
 
@@ -374,6 +375,8 @@ A prediction market: an outcome token costs p and pays 1. Its "price" here is
 the **best ask** (what buying that outcome costs now), converted to American
 and decimal odds. The main spread/total is the line priced closest to 50/50,
 re-chosen every minute (volume points at stale lines once a game is underway).
+An empty ask side (nothing to buy) or a crossed book suspends the price at once,
+so the last one stops competing; asks with no bids are still buyable and priced.
 Its socket requires the subscription to be the very first message.
 
 ### 4.4 Which feed sends what
@@ -442,11 +445,15 @@ test with the real event.
 **The better line for the bettor wins; price only breaks ties on the same line.**
 
 1. **Eligible:** status open, the book is not stale or down. Polymarket only
-   competes on a line some sportsbook also offers (or on moneylines).
+   competes on a line some sportsbook also offers (or on moneylines). If no
+   eligible sportsbook has an open price on that side at all, Polymarket's own
+   line is shown as best rather than nothing.
 2. **Better line:** spread, higher signed line (+3.5 beats +3; −3 beats −3.5);
    over, lower total; under, higher total. Moneyline has no line.
-3. **Same line:** higher decimal odds.
+3. **Same line:** higher decimal odds, using the precise decimal, so a move in
+   the decimal alone (same American price) recomputes best.
 4. **Exact tie:** most recently updated, then book name, so it's deterministic.
+   A re-confirmed unchanged price counts as an update here.
 
 So **−3 −110 beats −3.5 +100** for the favorite. A half point is worth more
 than 10 cents of price, and around 3 and 7 in the NFL it's worth far more:
@@ -526,6 +533,8 @@ however many people are watching. Browsers never cause a request to a book.
   `Seq`, with no gap and no duplicate (tested).
 - A disconnected viewer reconnects with `Last-Event-ID` and gets the missed deltas
   from a ring of the last 8,192, or a fresh snapshot if it fell further behind.
+  Replayed deltas update the board but aren't counted as latency samples (a
+  30 s outage would otherwise show up as a 30 s delivery).
 - A **slow viewer can't slow anyone down**: each has a 512-message queue; if
   it fills, that viewer is dropped and reconnects with resume. The board's own
   subscribers are dropped the same way at 1,024 (tested: a stalled subscriber is
@@ -540,6 +549,12 @@ its fixtures, and three lines of the registry, nothing in the supervisor, board,
 hub or page. The page reads the list of books from the snapshot, so the toggle
 and health cards appeared on their own. Supporting a different kind of price
 (probabilities) was one board option.
+
+To be precise about the page: it has since gained a few per-book labels (which
+book has no publish time, the wording of each book's handshake and ping, short
+names). A fourth book needs entries there; the cleaner fix is to put those as
+capability fields on the book's `Descriptor`. The architecture test also bans
+only the DraftKings and FanDuel names outside their packages.
 
 ---
 
@@ -559,18 +574,71 @@ The supervisor publishes each book's state, and the board and page act on it:
 - **Reconnect:** full-jitter backoff 1 s → 30 s, reset after 60 s connected. A
   fresh snapshot on every reconnect when the rate limit allows; otherwise the
   last one plus a reconcile 2 s after connecting (FanDuel's 2-minute discovery
-  limit would otherwise stall a reconnect for up to 2 minutes).
+  limit would otherwise stall a reconnect for up to 2 minutes). "The last one"
+  is the newest snapshot, including any background full refresh. Reusing it
+  is not counted as new data, so a book that keeps failing to connect still
+  ages into stale.
 - **Heartbeat watchdog:** any frame, keep-alive or pong; 90 s of silence
-  cancels and reconnects the stream.
+  cancels and reconnects the stream. REST work (reconcile polls, full
+  refreshes) runs in its own goroutine, so the watchdog is never stuck behind
+  a slow request; see the bug below.
 - **Resync:** anything a book can't map (a new game, an unknown ID) triggers a
   clean re-snapshot instead of a guess.
 - **Panics** in book code are recovered, logged, and treated as a stream error;
   other books carry on (tested).
 - **Snapshots never overwrite newer stream prices**, and FanDuel's cached
   discovery prices are replaced by an SMP read (or dated back 90 s if SMP fails).
+- **Removals stick:** the board remembers each removal for 10 minutes, so a
+  poll or snapshot that was requested before the book pulled a price can't
+  bring it back when it arrives afterwards.
 
 Measured recovery: killing DK's stream → live again in 0.9 s; FanDuel's during
 a live game → 1.1 s. The other books kept updating both times.
+
+#### A bug worth telling: the watchdog stuck behind REST
+
+Each book's supervisor runs one control loop that handles the heartbeat
+watchdog, the kill switch, the stream ending, and the timers for reconcile
+polls and full refreshes. The first version ran those REST calls **inside**
+that loop. While one was in flight, the loop couldn't do anything else, and a
+FanDuel full refresh is several requests (two league boards, the live board,
+then an SMP price read) with a 20–25 s HTTP timeout. If the socket died during
+a slow refresh, the watchdog couldn't notice and the reconnect couldn't start
+until the request returned. **Prices weren't delayed**, because the stream has
+its own goroutine; **detecting and recovering from a dead socket was.**
+
+The fix: REST work runs in its own goroutine, one job at a time per book, and
+hands its result back to the loop on a channel. The loop never waits on the
+network. Jobs share the stream's context, so stopping a stream also cancels a
+request still in flight, and the loop waits for a job before reconnecting, so
+two runs never overlap.
+
+It came out of a code review that read the loop and spotted the synchronous
+call. A test made it concrete: a fake book whose reconcile **never returns**
+and whose stream connects then goes silent. On the old code it fails ("watchdog
+did not fire while a reconcile was blocked in REST"); on the new code the
+watchdog fires at ~300 ms, the stuck request is cancelled, and the stream
+reconnects.
+
+Writing that test turned up a **second instance of the same bug**: while
+waiting out its backoff, the supervisor polls the book's REST API to keep
+prices fresh, and that poll could also hang past the wait, holding up the
+reconnect. Polls made during a backoff now share the wait's deadline, so a hung
+request can never stretch a backoff.
+
+**The fix had a bug of its own,** found by a second review. With one job at a
+time, a timer that fired while a job was running was simply skipped. That's
+fine for a price poll (another comes in 30 s), but full refreshes were skipped
+too, and the timers line up: Polymarket polls and refreshes every minute,
+FanDuel's 2-minute refresh lands on every fourth 30 s poll, DK's 5-minute one
+on every tenth. A full refresh could lose that race every time, and a full
+refresh is the only way new games and markets are found. Now a due refresh
+waits and runs as soon as the current job finishes. The same review found that
+a background refresh didn't update the snapshot the next reconnect starts from;
+now it does. Both have tests that fail on the previous code.
+
+The lesson generalizes beyond this app: in a supervisor, the control loop
+should only ever wait on channels, never on I/O.
 
 ### 8.2 Staleness the page makes obvious
 
@@ -589,9 +657,11 @@ a live game → 1.1 s. The other books kept updating both times.
 
 Books rarely say "final": DK deletes the event, but FanDuel and Polymarket can
 leave a finished game listed with every market suspended. A started game with
-no open price anywhere for 3 minutes is shown as **Closed · likely final**
-(dimmed, at the bottom) and removed 15 minutes later. Any open price brings it
-back; a pregame suspension never closes a game.
+no open price for 3 minutes is shown as **Closed · likely final** (dimmed, at
+the bottom) and removed 15 minutes later. Any open price brings it back; a
+pregame suspension never closes a game. Only books that aren't stale or down
+count: a book that went quiet still holding an open price would otherwise keep
+a finished game "live" forever.
 
 ---
 
@@ -631,8 +701,9 @@ One page, plain JavaScript, embedded in the binary.
 | FD replay (1,621 push frames, 3 connections) | 0 unknown markets |
 | Snapshot parity with the research normalizer | NFL pregame 25 games / 150 slots / 150 on both books / 124 same line; live 12 / 72 / 72 / 58 |
 | Best-price table | every rule above, incl. −3 −110 vs −3.5 +100, both total directions, suspended, stale book, Polymarket only on a book's line, deterministic ties |
-| Board | line move keeps the slot and records the previous price; older poll can't overwrite newer stream data; stale book recomputes best; confirmations; pregame/live latency split; finished game closes then leaves |
-| Supervisor (fake book) | reconnect + re-snapshot, resync, heartbeat timeout, poll fallback, panic isolation, live→degraded→live, snapshot failure → down → live, pause → stale → live, reconnect inside the rate limit |
+| Board | line move keeps the slot and records the previous price; older poll can't overwrite newer stream data; **older poll or snapshot can't revive a removed price**; stale book recomputes best; **decimal-only move and tie-breaking confirmation recompute best**; confirmations; pregame/live latency split; finished game closes then leaves; **a stale book can't hold a game open** |
+| Supervisor (fake book) | reconnect + re-snapshot, resync, heartbeat timeout, **watchdog fires during a REST call that never returns**, **a full refresh due during a poll runs after it**, **reconnect uses the newest background snapshot**, **reused seed and skipped polls don't count as fresh data**, poll fallback, panic isolation, live→degraded→live, snapshot failure → down → live, pause → stale → live, reconnect inside the rate limit |
+| Polymarket | parse real Gamma events, mirrored spread sides, ask-priced stream messages, **empty ask side suspends, ask-only priced, crossed suspends**, live flag follows the latest snapshot |
 | Fanout | snapshot then deltas with no gap, resume, too-old resume gets a snapshot, slow client dropped, ping, clock validity |
 | FanDuel | app key extracted from the real bundle, simulated key rotation recovers, esports refused, NBA competition filter |
 | Extensibility | no book names outside `internal/books` and `cmd` |
@@ -718,14 +789,131 @@ one `Register` line. What has to grow for ten:
   mid-week, that book shows down and the others carry on.
 - **Polymarket in best price** is a product choice made here; it ignores fees and
   depth, and Polymarket isn't available in every region (possibly including Ontario).
-- Two bugs found in live data during development and fixed: FanDuel esports
-  appearing as NFL games, and Polymarket's in-play flag going stale on stream
-  updates. Earlier progress notes that cited those esports games as real are
-  corrected in `app/PROGRESS.md`.
+- Bugs found during development and fixed: FanDuel esports appearing as NFL
+  games and Polymarket's in-play flag going stale on stream updates (both found
+  in live data), and the supervisor's watchdog stuck behind slow REST calls
+  (found in code review; [§8.1](#a-bug-worth-telling-the-watchdog-stuck-behind-rest)).
+  Earlier progress notes that cited those esports games as real are corrected
+  in `app/PROGRESS.md`.
+- **Code-review findings** that are fixed, and those deliberately left open, are
+  covered in [§14](#14-code-review-what-was-found-and-what-was-done). The
+  open item closest to biting is Polymarket's 100-event discovery cap (NBA
+  returned 94 events on 2026-10-26).
 
 ---
 
-## 14. Repository layout
+## 14. Code review: what was found and what was done
+
+Three reviews of `app/` were run on 2026-10-26: a first review (findings
+**#1–#10**), a follow-up on the watchdog fix (**R2-1–R2-3**), and an independent
+review (**F1–F16**). Every finding is listed below, with duplicates merged. The
+longer version, with the full reasoning for each finding, is in
+[`REVIEW_RESPONSE.md`](REVIEW_RESPONSE.md).
+
+### 14.1 How fixes were chosen
+
+A finding was **fixed** if it met at least one of these:
+
+1. It can show or pick a price that isn't really on offer. That's the core
+   promise of the board.
+2. It puts the board in a wrong state the user can see.
+3. It corrupts a number this README reports (latency or health).
+4. I introduced it.
+
+The fix also had to be small, and provable with a test that **fails on the old
+code and passes on the new**. Every fix below has one.
+
+A finding was **left open** if any of these held:
+
+- It needs a scale this deployment doesn't have: one instance, a handful of
+  viewers, tens of games.
+- It needs a book to send something never seen in hours of captured traffic.
+- It only happens during shutdown.
+- It sits behind a feature that's off in production.
+- Fixing it would trade one risk for another.
+
+### 14.2 Fixed
+
+| Finding | What went wrong | When it would bite | Fix |
+|---|---|---|---|
+| **R2-1** Full refreshes dropped behind polls (introduced by my watchdog fix) | One background job ran at a time, and a refresh timer that fired while a poll ran was skipped. The timers line up (Polymarket 1 min/1 min; FanDuel 2 min on every fourth 30 s poll; DK 5 min on every tenth), so a refresh could lose every time. Refreshes are the only way new games and markets, and Polymarket's main line, are found. | Every long-lived connection: the healthier the socket, the worse it gets. | A due refresh waits and runs when the current job ends. After deploying, Fly showed Polymarket at 3 snapshots and FanDuel at 2 within ~3.5 min, alongside their polls. |
+| **R2-2 / F15** Reconnect from an older snapshot | A background refresh updated the board but not the snapshot a reconnect starts from. | A socket drop shortly after a refresh, common live when markets change. | The refresh hands its snapshot to the control loop, which updates the reconnect seed. |
+| **#1 / F1** A removed price comes back | "Older REST data can't overwrite newer" only worked while the entry existed. A poll sent before a removal and arriving after it re-added the price, which could win **best**. | Live games: books pull and re-add constantly, and REST requests overlap the stream. | The board remembers removals for 10 min; poll or snapshot data no newer than a removal is ignored. |
+| **#2 / F2** Best price ignores decimal and tie changes | A decimal-only move (same American price) or a re-confirmation didn't recompute best, though both are inputs to the rule; connected browsers never saw the new decimal. | Two books at the same American price, constant at −110 and with Polymarket. | Decimal changes count as changes (no flash); confirmations recompute best. |
+| **#3 / F3** Polymarket keeps a price that can't be bought | An empty or crossed order book emitted nothing, so the last price stayed eligible for best; an ask with no bids was discarded. | Thin markets and markets closing. | No ask, or crossed: suspended with no price ("—"). Ask-only: priced. |
+| **#6 / F8** Health looks fresh without data | Reconnecting from a reused snapshot, and DK's self-skipped poll, both counted as fresh data, so a book could stay "degraded" (eligible for best) instead of going "stale". | A long outage, exactly when stale handling matters. | Reuse isn't data; `book.ErrSkipped` lets a book say it chose not to fetch. |
+| **F4** A stale book keeps a finished game live | Any open price kept a game open, even from a stale book; the game was never closed or pruned. | A book outage spanning the end of a game. | Only books that aren't stale or down count. |
+| **F5** Replayed deltas counted as latency | After a viewer reconnects, the missed deltas replay with their original times, so a 30 s outage became a 30 s sample in a 300-sample window. | Any viewer whose connection blips. | Frames sent more than 2 s earlier update the board but not latency (checked in the browser). |
+| **#4 / F6** A removed game's old prices reappear | The page removed the game but kept its cells; if the game came back, old prices showed beside the new one. | Long-open tabs; games that close and reopen. | Game removal clears its cells; empty cells are deleted (checked in the browser). |
+| **#7** REST blocked the watchdog | See [§8.1](#a-bug-worth-telling-the-watchdog-stuck-behind-rest). | A dead socket during a slow refresh. | REST off the control loop. |
+| Small | A price of 0 rendered as "0"; a CSS comment said 5 minutes. | — | "—"; comment corrected. |
+
+### 14.3 Documented, code unchanged
+
+| Finding | Decision |
+|---|---|
+| Polymarket can be best when no sportsbook has a price on that side (the old README said "only on a sportsbook's line") | Behaviour kept: one real price beats an empty cell, and a sportsbook line takes over as soon as one exists. Now stated in [§5.4](#54-best-price-when-books-are-on-different-lines). |
+| **F12** The third-book claim was too broad; the architecture test doesn't ban `polymarket` | [§7.3](#73-a-third-book-without-re-architecting) now says the page has a few per-book labels a fourth book would need, and names the clean fix (capability fields on the descriptor). |
+
+### 14.4 Left open
+
+| Finding | Impact | When it would bite | Why open |
+|---|---|---|---|
+| **F9 / #8** Polymarket discovery reads one page of 100 events | Games past 100 silently missing, and **removed** as if they'd ended. | NFL returned 42 events on 2026-10-26 but **NBA returned 94**: a busy stretch crosses it. | Not a wrong-price bug and wasn't in this round. **The next fix**: paging is small. |
+| **R2-3** Backoff polls cut off by a short reconnect deadline | A cancelled poll still uses its rate-limit window, so there are gaps with neither stream nor polling. | A socket failing repeatedly in the first backoff steps while REST works. | A trade-off: letting polls outlive the wait brings back the watchdog bug. Self-limiting within seconds. Fix: skip a poll that can't finish in the time left. |
+| **#5 / F7** SSE writes have no deadline | A client that stops reading holds a goroutine and connection until TCP gives up. Other viewers are **not** slowed. | Many broken clients, or abuse. | A few KB per stuck client at this scale; the fix needs a real slow-socket test. |
+| **F11** FanDuel bundle fetch retried every snapshot after a failure | Slower FanDuel snapshots and a warning every 2 min; prices still flow with the last keys. | Only while FanDuel's homepage is blocked (seen once, on a bad Fly IP). | Already-degraded mode with a working answer. |
+| **#10 / F10** Board calls can hang after the board stops | A stuck goroutine. | Shutdown only; every current caller has a cancelled context, so it resolves. | Not reachable from current code. |
+| **F13** A DK `change` frame can revive a removed selection as open | A pulled DK price reappears. | Only if DK sends a change for an ID it already removed; not seen across 7,276 replayed frames. | Unseen upstream behaviour; a one-line guard for the next pass. |
+| **F14** A DK spread/total without a line is emitted | A line-less quote ranked as line 0. | Only a partial add without points; every replayed frame had points. | Same as F13. |
+| **#9 / F16** Game history never pruned | Memory and tick work grow with uptime. | Months of uptime; kilobytes at tens of games a week. | Needs a shared board and matcher retention rule; not measurable here. |
+| Cancellation relies on each book honouring its context | A book doing work it can't cancel would block reconnect and shutdown. | No current book: all calls are context-aware. | The normal Go contract; abandoning a worker risks two runs of a book at once. |
+| Health says "live" until cleanup ends | Briefly live after the socket died. | Only with a slow-to-stop book; cleanup takes milliseconds now. | No visible effect today. |
+
+**Smaller items, all open:**
+
+- **Security and robustness**
+  - Debug kill/pause endpoints are unauthenticated, but they're off on Fly.
+  - SNTP replies aren't fully validated. That could skew latency numbers, never
+    odds.
+  - The server exits 0 if it can't bind its port; Fly's health check still
+    catches it.
+  - There's no idle timeout or bounded shutdown wait; measured shutdown is 327 ms.
+- **Ordering and lifecycle**
+  - Health updates can publish out of order; they self-correct within 1 s.
+  - The health loop can outlive `Run`, at shutdown only.
+- **The page**
+  - No sequence-gap check (SSE over TCP doesn't drop frames within a connection).
+  - Health cards are re-rendered every second.
+  - Each full re-render scans every slot.
+  - Latency samples are kept across an NTP offset change.
+- **FanDuel parsing**
+  - An event with no type defaults to NFL, and an empty competition ID passes
+    the esports filter. Every real event has both fields.
+- **Efficiency and cleanup**
+  - `/api/board` copies the whole board per request.
+  - DK's `state.gone` map is never read.
+  - Book constructor errors are ignored (they can't fail today).
+  - `boardctl` miscounts confirmation deltas.
+  - A stale comment in `static.go`.
+- **Test coverage**
+  - `clocksync` and `cmd/` are untested; there are no fuzz tests and no browser
+    tests.
+  - Every fix in 14.2 added a regression test, and the page fixes were checked
+    in a live browser. Browser tests and decoder fuzzing are the next testing
+    investment.
+
+**Next, in order:**
+
+1. F9 paging.
+2. The two DK guards, F13 and F14.
+3. The SSE write deadline, F7.
+4. Bundle-fetch backoff (F11) and the exit code.
+5. An explicit fallback-poll policy for R2-3.
+
+---
+
+## 15. Repository layout
 
 ```
 app/

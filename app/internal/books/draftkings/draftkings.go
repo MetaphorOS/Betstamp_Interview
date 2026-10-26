@@ -138,7 +138,7 @@ func (b *bookImpl) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, 
 	b.mu.Unlock()
 	if recent {
 		// A snapshot just read the same endpoint; nothing newer to fetch.
-		return nil, nil
+		return nil, book.ErrSkipped
 	}
 	snap, err := b.Snapshot(ctx)
 	if err != nil {

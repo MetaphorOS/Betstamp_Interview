@@ -189,21 +189,22 @@ func (sd *seed) apply(raw []byte, recvAt time.Time, live liveFunc) ([]model.Upda
 		case "book":
 			// A book message is current state; its timestamp is the last
 			// change, possibly hours ago, so it is not a publish time.
+			// It is the whole book, so no asks means nothing to buy.
 			bid, ask := bestOf(m.Bids, true), bestOf(m.Asks, false)
-			u, err := sd.update(m.AssetID, bid, ask, recvAt, time.Time{}, live)
+			u, err := sd.update(m.AssetID, bid, ask, true, recvAt, time.Time{}, live)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, u...)
 		case "best_bid_ask":
-			u, err := sd.update(m.AssetID, num(m.BestBid), num(m.BestAsk), recvAt, bookTS, live)
+			u, err := sd.update(m.AssetID, num(m.BestBid), num(m.BestAsk), m.BestAsk != "", recvAt, bookTS, live)
 			if err != nil {
 				return nil, err
 			}
 			out = append(out, u...)
 		case "price_change":
 			for _, pc := range m.PriceChanges {
-				u, err := sd.update(pc.AssetID, num(pc.BestBid), num(pc.BestAsk), recvAt, bookTS, live)
+				u, err := sd.update(pc.AssetID, num(pc.BestBid), num(pc.BestAsk), pc.BestAsk != "", recvAt, bookTS, live)
 				if err != nil {
 					return nil, err
 				}
@@ -214,16 +215,26 @@ func (sd *seed) apply(raw []byte, recvAt time.Time, live liveFunc) ([]model.Upda
 	return out, nil
 }
 
-func (sd *seed) update(asset string, bid, ask float64, recvAt, bookTS time.Time, live liveFunc) ([]model.Update, error) {
+// update prices a token at its best ask, the cost to buy. askKnown is false
+// when the message says nothing about the ask side. A bid is not needed to
+// buy, so an ask-only book is priced; no ask, or a crossed book, suspends the
+// quote so the last price stops competing for best.
+func (sd *seed) update(asset string, bid, ask float64, askKnown bool, recvAt, bookTS time.Time, live liveFunc) ([]model.Update, error) {
 	t := sd.tokens[asset]
 	if t == nil {
 		return nil, fmt.Errorf("%w: unknown token %s", book.ErrResync, asset)
 	}
-	if bid <= 0 || ask <= 0 || ask > 1 || bid > ask {
-		return nil, nil
+	if !askKnown || ask > 1 {
+		return nil, nil // no news, or malformed
 	}
-	am, dec := convert(ask)
+	var am int
+	var dec float64
 	status := model.StatusOpen
+	if ask <= 0 || (bid > 0 && bid > ask) {
+		status = model.StatusSuspended
+	} else {
+		am, dec = convert(ask)
+	}
 	if am == 0 || t.closed {
 		status = model.StatusSuspended
 	}
