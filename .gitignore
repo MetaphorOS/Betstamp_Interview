@@ -1,16 +1,14 @@
+# Research data and scratch (large, local captures of third-party responses).
+research/captures/
+research/out/
+research/work/
 node_modules/
-captures/
-out/
-work/
 
 # Go toolchain caches kept inside the workspace for this machine's sandbox.
 .gopath/
 .gomodcache/
 .gocache/
 .gotmp/
-go/.gotmp/
-go/oddsfeed.exe
-normalizer/normctl.exe
+research/go/.gotmp/
 
-app/.gotmp/
 *.exe

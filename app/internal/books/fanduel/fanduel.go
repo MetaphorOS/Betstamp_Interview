@@ -129,10 +129,7 @@ func New(cfg Config) (book.Book, error) {
 		cfg.HomeURL = DefaultHomeURL
 	}
 	if cfg.BundlePath == "" {
-		cfg.BundlePath = os.Getenv("FD_MAIN_JS")
-	}
-	if cfg.BundlePath == "" {
-		cfg.BundlePath = "captures/fd-main.js"
+		cfg.BundlePath = os.Getenv("FD_MAIN_JS") // empty: no file fallback, live fetch only
 	}
 	if cfg.Timeout == 0 {
 		cfg.Timeout = 25 * time.Second

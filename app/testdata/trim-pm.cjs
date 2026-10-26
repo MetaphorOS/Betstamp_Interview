@@ -1,10 +1,10 @@
-// Trims out/pm-nfl-events.json (Gamma NFL events, gitignored) to the game
+// Trims research/out/pm-nfl-events.json (Gamma NFL events, gitignored) to the game
 // events and main market types the polymarket book reads. Run from repo root:
 //   node app/testdata/trim-pm.cjs
 const fs = require("fs");
 const path = require("path");
 const root = path.resolve(__dirname, "..", "..");
-const src = JSON.parse(fs.readFileSync(path.join(root, "out", "pm-nfl-events.json"), "utf8"));
+const src = JSON.parse(fs.readFileSync(path.join(root, "research", "out", "pm-nfl-events.json"), "utf8"));
 const events = Array.isArray(src) ? src : src.events;
 const pick = (o, ks) => Object.fromEntries(ks.filter((k) => o[k] !== undefined).map((k) => [k, o[k]]));
 const types = new Set(["moneyline", "spreads", "totals"]);

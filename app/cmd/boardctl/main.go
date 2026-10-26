@@ -40,7 +40,7 @@ func main() {
 	slog.SetDefault(log)
 
 	if *bundle == "" {
-		for _, p := range []string{"captures/fd-main.js", "../captures/fd-main.js"} {
+		for _, p := range []string{"research/captures/fd-main.js", "../research/captures/fd-main.js"} {
 			if _, err := os.Stat(p); err == nil {
 				*bundle = p
 				break

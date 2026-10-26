@@ -4,7 +4,7 @@ Everything below was measured by the tests in this module or by `boardctl`
 live runs from the Ontario dev PC on 2026-10-25/26. Re-run with:
 
 ```bash
-. ../goenv.sh && go vet ./... && go test -race ./... -count=1 -v
+. ../research/goenv.sh && go vet ./... && go test -race ./... -count=1 -v
 ```
 
 ## Replay acceptance tests (section 11)
@@ -68,7 +68,7 @@ directly; Polymarket's NFL series has no esports).
 
 - **FD bundle live fetch works** from this PC: `GET on.sportsbook.fanduel.ca/`
   → `static/js/main.ea04e06bc3f1ff8b.js` → client ID `NfxZUK…`. No bot wall
-  was hit. The `captures/fd-main.js` fallback is still wired in.
+  was hit. The `research/captures/fd-main.js` fallback is still wired in.
 - **FD discovery boards are CDN-cached** (`max-age=30, swr=60`). The snapshot
   now re-reads prices from SMP (no-cache). If SMP fails, `AsOf` is dated
   back 90 s so cached prices never overwrite fresher data.

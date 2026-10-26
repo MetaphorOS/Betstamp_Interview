@@ -161,9 +161,9 @@ func TestBundleParse(t *testing.T) {
 }
 
 func TestCapturedBundleParses(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "captures", "fd-main.js"))
+	raw, err := os.ReadFile(filepath.Join("..", "..", "..", "..", "research", "captures", "fd-main.js"))
 	if err != nil {
-		t.Skip("captures/fd-main.js not present:", err)
+		t.Skip("research/captures/fd-main.js not present:", err)
 	}
 	b, err := ParseBundle(string(raw))
 	if err != nil {

@@ -161,6 +161,9 @@ func prefix(s string) string {
 }
 
 func (p *bundleProvider) readFile() (*Bundle, error) {
+	if p.path == "" || p.path == "-" {
+		return nil, errors.New("no bundle file configured (set FD_MAIN_JS)")
+	}
 	raw, err := os.ReadFile(p.path)
 	if err != nil {
 		return nil, err

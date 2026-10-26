@@ -1,5 +1,5 @@
 // Regenerates the trimmed soak replay fixtures in this directory from
-// out/soak-1h (which is gitignored). Every received frame is kept; only fields
+// research/out/soak-1h (which is gitignored). Every received frame is kept; only fields
 // the app never parses are dropped. Run from the repo root:
 //
 //   node app/testdata/trim.cjs
@@ -9,7 +9,7 @@ const fs = require("fs");
 const path = require("path");
 
 const root = path.resolve(__dirname, "..", "..");
-const soak = path.join(root, "out", "soak-1h");
+const soak = path.join(root, "research", "out", "soak-1h");
 
 function pick(o, keys) {
   if (!o || typeof o !== "object") return o;

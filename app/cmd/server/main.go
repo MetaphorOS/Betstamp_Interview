@@ -34,7 +34,7 @@ import (
 
 func main() {
 	addr := flag.String("addr", ":"+envOr("PORT", "8080"), "listen address")
-	bundle := flag.String("fd-bundle", os.Getenv("FD_MAIN_JS"), "captured FanDuel main.js fallback")
+	bundle := flag.String("fd-bundle", os.Getenv("FD_MAIN_JS"), "captured FanDuel main.js fallback (default: research/captures/fd-main.js if present)")
 	pmBest := flag.Bool("pm-best", os.Getenv("PM_IN_BEST") != "0", "let prediction markets (priced at the ask) win best price")
 	ntp := flag.String("ntp", envOr("NTP_SERVER", "time.google.com"), "SNTP server for the clock-offset correction (empty = off)")
 	debug := flag.Bool("debug", os.Getenv("DEBUG_ENDPOINTS") == "1", "enable POST /debug/kill/{book} and /debug/pause/{book}")
@@ -45,6 +45,15 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
+	if *bundle == "" {
+		// Local runs: use the captured bundle as a fallback when it is there.
+		for _, p := range []string{"research/captures/fd-main.js", "../research/captures/fd-main.js"} {
+			if _, err := os.Stat(p); err == nil {
+				*bundle = p
+				break
+			}
+		}
+	}
 	reg := books.Default(books.Options{FanDuelBundlePath: *bundle})
 	descs := make([]book.Descriptor, 0)
 	for _, b := range reg.Books() {

@@ -421,7 +421,7 @@ function cell(gid, family, outcome) {
   const who = state.mode === "best" ? `${esc(short(book))} · ` : "";
   const title = `${displayName(book)} · updated ${age(e.at)}${e.live ? " · in play" : ""}`;
   return `<div class="${cls}" title="${esc(title)}">
-      <span class="old-icon" aria-label="Price not confirmed for over 5 minutes" title="Price not confirmed for over 5 minutes">⚠</span>
+      <span class="old-icon" aria-label="Price not confirmed for over 3 minutes" title="Price not confirmed for over 3 minutes">⚠</span>
       <span class="px">${ln ? `<span class="ln">${esc(ln)}</span>` : ""}${price(e.am, e.dec)} ${arrow}</span>
       ${prev}
       <span class="meta" data-at="${e.at || 0}" data-who="${who}">${who}${age(e.at)}</span>
@@ -429,8 +429,10 @@ function cell(gid, family, outcome) {
 }
 
 // A price is old when we have not confirmed it (stream update, or a poll or
-// snapshot seeing the same price) for 5 minutes. Polls run every 30-60 s.
-const OLD_AFTER_MS = 5 * 60 * 1000;
+// snapshot seeing the same price) for 3 minutes: under the 5-minute full
+// REST refresh, so a price the refresh would have to rescue still shows it.
+// Polls run every 30-60 s.
+const OLD_AFTER_MS = 3 * 60 * 1000;
 const isOld = (at) => !!at && serverNow() - at > OLD_AFTER_MS;
 
 // Ages tick without re-rendering cells (which would re-trigger flashes).
