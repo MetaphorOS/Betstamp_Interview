@@ -2,9 +2,9 @@
 
 Three reviews of `app/` were done on 2026-10-26:
 
-- [`APP_CODE_QUALITY_REVIEW.md`](APP_CODE_QUALITY_REVIEW.md) (first review, findings **#1–#10**)
-- [`APP_CODE_QUALITY_REVIEW_ROUND_2.md`](APP_CODE_QUALITY_REVIEW_ROUND_2.md) (follow-up on the watchdog fix, **R2-1–R2-3**)
-- [`APP_REVIEW_INDEPENDENT.md`](APP_REVIEW_INDEPENDENT.md) (independent review, **F1–F16**)
+- [`APP_CODE_QUALITY_REVIEW.md`](research/APP_CODE_QUALITY_REVIEW.md) (first review, findings **#1–#10**)
+- [`APP_CODE_QUALITY_REVIEW_ROUND_2.md`](research/APP_CODE_QUALITY_REVIEW_ROUND_2.md) (follow-up on the watchdog fix, **R2-1–R2-3**)
+- [`APP_REVIEW_INDEPENDENT.md`](research/APP_REVIEW_INDEPENDENT.md) (independent review, **F1–F16**)
 
 This document covers **every problem the three reviews raised**, de-duplicated.
 For each one it gives:
