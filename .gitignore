@@ -15,3 +15,6 @@ research/go/.gotmp/
 
 # Internal working notes retained locally.
 .local-notes/
+
+# Local agent and debugger config (absolute paths for this machine).
+.claude/

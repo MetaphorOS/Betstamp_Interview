@@ -10,6 +10,12 @@ primary_region = "yyz"
 
 [env]
   PORT = "8080"
+  # Also set in the image (Dockerfile); declared here so `fly config show` and
+  # the machine config carry it explicitly, and so it survives a base-image
+  # change. Drops the two P-curve ML-KEM key exchanges from the default TLS
+  # ClientHello, which one book's edge otherwise answers with an HTML 403.
+  # README §13.
+  GODEBUG = "tlssecpmlkem=0"
 
 [http_service]
   internal_port = 8080

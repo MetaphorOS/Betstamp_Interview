@@ -182,3 +182,43 @@ td.team small { display: block; font-weight: 400; color: var(--muted); font-size
 .hrow.sub > span:first-child { padding-left: 12px; font-size: 11px; }
 .hrow.sub { padding-top: 0; }
 .muted { color: var(--muted); }
+
+/* player props */
+.game.wide { grid-column: 1 / -1; }
+.props-toggle {
+  display: flex; align-items: center; gap: 6px; width: 100%;
+  border: 0; border-top: 1px solid var(--line); background: transparent; color: var(--text);
+  font: inherit; font-size: 12px; font-weight: 600; padding: 8px 12px; cursor: pointer; text-align: left;
+}
+.props-toggle .chev { margin-left: auto; color: var(--muted); }
+.props-toggle:hover { background: var(--panel-2); }
+.props-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.props { border-top: 1px solid var(--line); padding: 8px 12px 12px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+.chips button {
+  border: 1px solid var(--line); background: var(--panel-2); color: var(--muted);
+  font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px; border-radius: 999px; cursor: pointer;
+}
+.chips button[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: #04130a; }
+.chips button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.ptable-wrap { max-height: 560px; overflow: auto; }
+.ptable { table-layout: auto; font-size: 12.5px; }
+.ptable th { position: sticky; top: 0; background: var(--panel); z-index: 1; padding: 4px 6px; }
+.ptable th.pname-h { text-align: left; }
+.ptable td { padding: 2px 4px; }
+.ptable tr.pfirst td { border-top: 1px solid var(--line); }
+.ptable td.pname { text-align: left; font-weight: 600; vertical-align: top; padding-top: 6px; white-space: nowrap; }
+.ptable td.plabel { color: var(--muted); font-size: 11.5px; white-space: nowrap; }
+.pc {
+  display: inline-block; min-width: 76px; padding: 4px 6px; border-radius: 6px;
+  background: var(--panel-2); font-weight: 700; white-space: nowrap;
+}
+.pc .ln { color: var(--muted); font-weight: 600; margin-right: 5px; }
+.pc.best { background: var(--up-bg); box-shadow: inset 0 0 0 1px var(--up); }
+.pc.none { background: transparent; color: var(--stale); font-weight: 500; }
+.pc.susp { opacity: 0.5; text-decoration: line-through; }
+.pc.stale { opacity: 0.4; filter: grayscale(1); }
+@media (max-width: 520px) {
+  .pc { min-width: 0; padding: 3px 4px; }
+  .ptable td.pname { white-space: normal; }
+}

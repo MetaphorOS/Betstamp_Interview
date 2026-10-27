@@ -54,11 +54,13 @@ type League struct {
 	// league's competition: by ID, or by the competition's attached name.
 	CompetitionID   string
 	CompetitionName string
+	// Props: read each pregame event's player props from MGA.
+	Props bool
 }
 
 // DefaultLeagues: NFL and NBA.
 var DefaultLeagues = []League{
-	{Sport: "nfl", PageID: "nfl", EventTypeID: "6423", CompetitionID: "12282733", CompetitionName: "NFL"},
+	{Sport: "nfl", PageID: "nfl", EventTypeID: "6423", CompetitionID: "12282733", CompetitionName: "NFL", Props: true},
 	{Sport: "nba", PageID: "nba", EventTypeID: "7522", CompetitionID: "10547864", CompetitionName: "NBA"},
 }
 
@@ -92,6 +94,7 @@ type Config struct {
 	InPlayURL  string // live board, merged into discovery; "-" disables
 	Path       string // read one board from a file instead of the network (tests)
 	SMPURL     string
+	MGAURL     string // event market search, for player props
 	WSURL      string
 	HomeURL    string // frontend page the JS bundle is discovered from
 	BundlePath string // read-only bundle fallback; FD_MAIN_JS overrides
@@ -121,6 +124,9 @@ func New(cfg Config) (book.Book, error) {
 	}
 	if cfg.SMPURL == "" {
 		cfg.SMPURL = DefaultSMPURL
+	}
+	if cfg.MGAURL == "" {
+		cfg.MGAURL = DefaultMGAURL
 	}
 	if cfg.WSURL == "" {
 		cfg.WSURL = DefaultWSURL
@@ -225,13 +231,40 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err := b.addProps(ctx, snap); err != nil {
+		return nil, err
+	}
 	if err := b.freshPrices(ctx, snap); err != nil {
 		// Keep the cached prices, but date them back past the CDN window so
 		// they never overwrite anything fresher on the board.
 		slog.Warn("fanduel snapshot: SMP price refresh failed; using cached board prices", "error", err)
 		snap.AsOf = snap.AsOf.Add(-cdnWindow)
 	}
+	dropUnpriced(snap)
 	return snap, nil
+}
+
+// addProps reads player props for every pregame event in a props league.
+// All or none, like the boards: a missing event would look like its props
+// were pulled. Live games are skipped; their props are not compared.
+func (b *bookImpl) addProps(ctx context.Context, snap *book.Snapshot) error {
+	props := map[string]bool{}
+	for _, l := range b.cfg.Leagues {
+		props[l.Sport] = l.Props
+	}
+	for _, g := range snap.Games {
+		if !props[g.Sport] || g.Live {
+			continue
+		}
+		raw, err := b.mga(ctx, g.BookGameID)
+		if err != nil {
+			return fmt.Errorf("fanduel: props for %s: %w", g.Name, err)
+		}
+		if err := AddProps(snap, g, raw); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // cdnWindow is max-age + stale-while-revalidate on the discovery boards.
@@ -270,7 +303,7 @@ func (b *bookImpl) freshPrices(ctx context.Context, snap *book.Snapshot) error {
 				}
 				q.Price.Status = fdStatus(m.MarketStatus, r.RunnerStatus)
 				q.Price.InPlay = m.IsInPlay()
-				if ms.family != model.FamilyMoneyline && r.Handicap != nil {
+				if ms.family != model.FamilyMoneyline && !ms.fixedLine && r.Handicap != nil {
 					q.Line = model.CopyLine(r.Handicap)
 				}
 				rs.line, rs.american, rs.decimal, rs.status = model.CopyLine(q.Line), q.Price.American, q.Price.Decimal, q.Price.Status
@@ -450,6 +483,7 @@ func buildSnapshot(asOf time.Time, leagues []League, boards ...fdBoard) (*book.S
 	}
 	sort.Slice(games, func(i, j int) bool { return games[i].BookGameID < games[j].BookGameID })
 	sort.Strings(sd.ids)
+	sd.mainIDs = append([]string(nil), sd.ids...)
 	return &book.Snapshot{
 		Games: games, Quotes: quotes, AsOf: asOf, Skipped: skipped,
 		Subscription: strings.Join(sd.ids, ","), Private: sd,

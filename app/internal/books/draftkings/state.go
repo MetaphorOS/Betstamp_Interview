@@ -25,8 +25,13 @@ type evState struct {
 
 type mktState struct {
 	family, stat, comparator, eventID string
+	threshold                         float64 // TD scorer markets
 	suspended                         bool
 	sels                              map[string]bool
+}
+
+func (ms *mktState) class() mainClass {
+	return mainClass{family: ms.family, stat: ms.stat, comparator: ms.comparator, threshold: ms.threshold}
 }
 
 type selState struct {
@@ -295,7 +300,7 @@ func (s *state) resolveNew(e dkEvent) (home, away model.Team, ok bool) {
 func (a *applier) addMarket(m dkMarket) {
 	s := a.s
 	id := m.ID.String()
-	c, ok := classifyMain(m)
+	c, ok := classify(m)
 	if !ok || s.events[m.EventID.String()] == nil {
 		s.ignored[id] = true
 		return
@@ -313,7 +318,7 @@ func (a *applier) addMarket(m dkMarket) {
 		}
 		s.markets[id] = ms
 	}
-	ms.family, ms.stat, ms.comparator, ms.eventID = c.family, c.stat, c.comparator, m.EventID.String()
+	ms.family, ms.stat, ms.comparator, ms.threshold, ms.eventID = c.family, c.stat, c.comparator, c.threshold, m.EventID.String()
 	if m.IsSuspended != nil && *m.IsSuspended != ms.suspended {
 		ms.suspended = *m.IsSuspended
 		a.emitMarket(ms)
@@ -384,15 +389,32 @@ func (a *applier) applySelection(d dkSelection, isAdd bool) error {
 	case marketID != "" && s.markets[marketID] != nil:
 		ms := s.markets[marketID]
 		ev := s.events[ms.eventID]
-		outcome, ok := outcomeFor(ms.family, d.OutcomeType, ev.homeID, ev.awayID)
-		if !ok {
-			return fmt.Errorf("%w: selection %s outcome %q in market %s", book.ErrResync, id, d.OutcomeType, marketID)
+		var identity string
+		var line *float64
+		if ms.family == model.FamilyPlayer {
+			player, outcome, ln, ok := propFacets(ms.class(), d)
+			if !ok {
+				if d.Participants != nil && (len(d.Participants) == 0 || d.Participants[0].Type != "Player") {
+					// A team (D/ST) on a TD scorer list: never mapped.
+					s.skipSels[id] = true
+					s.stats.SkippedSelections++
+					return nil
+				}
+				return fmt.Errorf("%w: prop selection %s in market %s has no player or line", book.ErrResync, id, marketID)
+			}
+			q := model.PropQuote(model.Quote{}, player, ms.stat, ms.comparator, outcome, ln)
+			identity, line = model.IdentityKey(q), q.Line
+		} else {
+			outcome, ok := outcomeFor(ms.family, d.OutcomeType, ev.homeID, ev.awayID)
+			if !ok {
+				return fmt.Errorf("%w: selection %s outcome %q in market %s", book.ErrResync, id, d.OutcomeType, marketID)
+			}
+			identity = model.IdentityKey(model.Quote{
+				Family: ms.family, Period: model.PeriodFull, Subject: "event",
+				Stat: ms.stat, Comparator: ms.comparator, Outcome: outcome,
+			})
 		}
-		identity := model.IdentityKey(model.Quote{
-			Family: ms.family, Period: model.PeriodFull, Subject: "event",
-			Stat: ms.stat, Comparator: ms.comparator, Outcome: outcome,
-		})
-		cur = &selState{identity: identity, gameRef: ms.eventID, marketID: marketID, family: ms.family}
+		cur = &selState{identity: identity, gameRef: ms.eventID, marketID: marketID, family: ms.family, line: line}
 		s.sels[id] = cur
 	case marketID != "" && s.ignored[marketID]:
 		s.skipSels[id] = true

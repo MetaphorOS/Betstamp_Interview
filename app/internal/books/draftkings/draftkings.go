@@ -38,10 +38,26 @@ const (
 type League struct {
 	Sport string // canonical sport, also the team registry
 	ID    string // DK leagueId
+	// Props are the player-prop subcategories read on each snapshot. Each
+	// one is a separate GET with its own WebSocket subscription partial.
+	Props []PropSub
 }
 
-// DefaultLeagues: NFL and NBA game lines.
-var DefaultLeagues = []League{{Sport: "nfl", ID: "88808"}, {Sport: "nba", ID: "42648"}}
+// PropSub is one DK prop subcategory: /leagues/{id}/categories/{Category}/subcategories/{Sub}.
+type PropSub struct{ Category, Sub string }
+
+// NFLProps: full-game O/U lines, milestone ladders and the TD scorer list
+// (research/out/props-2026-10-27/dk-nfl-wide).
+var NFLProps = []PropSub{
+	{"1000", "9524"}, {"1000", "9525"}, {"1000", "9517"}, {"1000", "9522"}, {"1000", "9532"}, {"1000", "15937"},
+	{"1001", "9514"}, {"1001", "9518"}, {"1001", "9523"}, {"1342", "14114"}, {"1342", "14115"},
+	{"1000", "16568"}, {"1000", "16569"}, {"1000", "16888"}, {"1000", "16889"}, {"1000", "16896"},
+	{"1001", "16571"}, {"1001", "16572"}, {"1001", "16820"}, {"1342", "16570"}, {"1342", "16821"},
+	{"1003", "12438"},
+}
+
+// DefaultLeagues: NFL (game lines and player props) and NBA game lines.
+var DefaultLeagues = []League{{Sport: "nfl", ID: "88808", Props: NFLProps}, {Sport: "nba", ID: "42648"}}
 
 // Config is owned by this book package, not by the framework.
 type Config struct {
@@ -112,26 +128,55 @@ func (b *bookImpl) Snapshot(ctx context.Context) (*book.Snapshot, error) {
 		}
 		return ParseSnapshot(raw, asOf)
 	}
+	docs, err := b.readLeagues(ctx, true)
+	if err != nil {
+		return nil, err
+	}
+	return buildSnapshot(asOf, docs...)
+}
+
+// readLeagues reads each league's game lines and, withProps, its prop
+// subcategories. Every read must succeed: a missing body would look like
+// its markets ended.
+func (b *bookImpl) readLeagues(ctx context.Context, withProps bool) ([]leagueDoc, error) {
 	b.mu.Lock()
 	b.lastRead = time.Now()
 	b.mu.Unlock()
 	docs := make([]leagueDoc, 0, len(b.cfg.Leagues))
 	for _, l := range b.cfg.Leagues {
+		ld := leagueDoc{league: l}
 		raw, err := b.read(ctx, LeagueURL+l.ID)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", l.Sport, err)
 		}
-		var doc dkDoc
-		if err := json.Unmarshal(raw, &doc); err != nil {
+		if err := ld.add(raw); err != nil {
 			return nil, fmt.Errorf("draftkings: decode %s snapshot: %w", l.Sport, err)
 		}
-		docs = append(docs, leagueDoc{league: l, doc: doc})
+		if !withProps {
+			docs = append(docs, ld)
+			continue
+		}
+		for _, p := range l.Props {
+			raw, err := b.read(ctx, LeagueURL+l.ID+"/categories/"+p.Category+"/subcategories/"+p.Sub)
+			var he *HTTPError
+			if errors.As(err, &he) && he.Status == http.StatusNotFound {
+				continue // subcategory not posted right now
+			}
+			if err != nil {
+				return nil, fmt.Errorf("%s props %s: %w", l.Sport, p.Sub, err)
+			}
+			if err := ld.add(raw); err != nil {
+				return nil, fmt.Errorf("draftkings: decode %s props %s: %w", l.Sport, p.Sub, err)
+			}
+		}
+		docs = append(docs, ld)
 	}
-	return buildSnapshot(asOf, docs...)
+	return docs, nil
 }
 
-// Poll re-reads the snapshot and returns its quotes as poll updates. DK has no
-// cheaper price-only endpoint.
+// Poll re-reads the game lines and returns their quotes as poll updates. DK
+// has no cheaper price-only endpoint. Props are not polled: they are 22
+// requests, so they ride the stream and the periodic resnapshot.
 func (b *bookImpl) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, error) {
 	b.mu.Lock()
 	recent := time.Since(b.lastRead) < restGap
@@ -140,7 +185,17 @@ func (b *bookImpl) Poll(ctx context.Context, _ *book.Snapshot) ([]model.Update, 
 		// A snapshot just read the same endpoint; nothing newer to fetch.
 		return nil, book.ErrSkipped
 	}
-	snap, err := b.Snapshot(ctx)
+	var snap *book.Snapshot
+	var err error
+	if b.cfg.Path != "" {
+		snap, err = b.Snapshot(ctx)
+	} else {
+		asOf := time.Now()
+		var docs []leagueDoc
+		if docs, err = b.readLeagues(ctx, false); err == nil {
+			snap, err = buildSnapshot(asOf, docs...)
+		}
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -191,18 +246,45 @@ func ParseSnapshot(raw []byte, asOf time.Time) (*book.Snapshot, error) {
 	return ParseLeagueSnapshot(raw, DefaultLeagues[0], asOf)
 }
 
-// ParseLeagueSnapshot builds a snapshot from one league's REST body.
-func ParseLeagueSnapshot(raw []byte, l League, asOf time.Time) (*book.Snapshot, error) {
-	var doc dkDoc
-	if err := json.Unmarshal(raw, &doc); err != nil {
-		return nil, fmt.Errorf("draftkings: decode snapshot: %w", err)
+// ParseLeagueSnapshot builds a snapshot from one league's REST bodies: the
+// game lines first, then any prop subcategories.
+func ParseLeagueSnapshot(raw []byte, l League, asOf time.Time, props ...[]byte) (*book.Snapshot, error) {
+	ld := leagueDoc{league: l}
+	for _, r := range append([][]byte{raw}, props...) {
+		if err := ld.add(r); err != nil {
+			return nil, fmt.Errorf("draftkings: decode snapshot: %w", err)
+		}
 	}
-	return buildSnapshot(asOf, leagueDoc{league: l, doc: doc})
+	return buildSnapshot(asOf, ld)
 }
 
+// leagueDoc is one league's bodies merged: events deduplicated, markets and
+// selections appended, and every body's subscription partials kept.
 type leagueDoc struct {
-	league League
-	doc    dkDoc
+	league   League
+	doc      dkDoc
+	partials []map[string]any
+}
+
+func (ld *leagueDoc) add(raw []byte) error {
+	var d dkDoc
+	if err := json.Unmarshal(raw, &d); err != nil {
+		return err
+	}
+	seen := make(map[string]bool, len(ld.doc.Events))
+	for _, e := range ld.doc.Events {
+		seen[e.ID.String()] = true
+	}
+	for _, e := range d.Events {
+		if !seen[e.ID.String()] {
+			seen[e.ID.String()] = true
+			ld.doc.Events = append(ld.doc.Events, e)
+		}
+	}
+	ld.doc.Markets = append(ld.doc.Markets, d.Markets...)
+	ld.doc.Selections = append(ld.doc.Selections, d.Selections...)
+	ld.partials = append(ld.partials, entityPartials(d.SubscriptionPartials)...)
+	return nil
 }
 
 func buildSnapshot(asOf time.Time, docs ...leagueDoc) (*book.Snapshot, error) {
@@ -216,7 +298,7 @@ func buildSnapshot(asOf time.Time, docs ...leagueDoc) (*book.Snapshot, error) {
 		g, q := addLeague(sd, ld.league.Sport, ld.doc, skipped)
 		games = append(games, g...)
 		quotes = append(quotes, q...)
-		partials = append(partials, entityPartials(ld.doc.SubscriptionPartials)...)
+		partials = append(partials, ld.partials...)
 	}
 	sd.partials = partials
 	return &book.Snapshot{
@@ -256,7 +338,7 @@ func addLeague(sd *state, sport string, doc dkDoc, skipped map[string]int) ([]mo
 	marketsByID := make(map[string]dkMarket, len(doc.Markets))
 	for _, m := range doc.Markets {
 		marketsByID[m.ID.String()] = m
-		c, ok := classifyMain(m)
+		c, ok := classify(m)
 		if !ok {
 			sd.ignored[m.ID.String()] = true
 			continue
@@ -266,7 +348,7 @@ func addLeague(sd *state, sport string, doc dkDoc, skipped map[string]int) ([]mo
 			continue
 		}
 		sd.markets[m.ID.String()] = &mktState{
-			family: c.family, stat: c.stat, comparator: c.comparator,
+			family: c.family, stat: c.stat, comparator: c.comparator, threshold: c.threshold,
 			eventID: m.EventID.String(), suspended: m.suspended(), sels: map[string]bool{},
 		}
 	}
@@ -279,7 +361,7 @@ func addLeague(sd *state, sport string, doc dkDoc, skipped map[string]int) ([]mo
 			sd.skipSels[s.ID.String()] = true
 			continue
 		}
-		c, ok := classifyMain(m)
+		c, ok := classify(m)
 		if !ok {
 			skipped["unmapped_market"]++
 			sd.skipSels[s.ID.String()] = true
@@ -365,11 +447,42 @@ type mainClass struct {
 	family     string
 	stat       string
 	comparator string
+	threshold  float64 // TD scorer markets: the fixed N in "N+ touchdowns"
 }
 
-// classifyMain uses the market type name plus a full-game period check. DK
+// propTypes maps DK prop market type names. An O/U market is one player's
+// two-way line; a milestone market is one player's ladder, each rung
+// carrying milestoneValue; a TD market lists every player.
+var propTypes = map[string]mainClass{
+	"Passing Yards O/U":                      {stat: model.StatPassYds, comparator: model.ComparatorOU},
+	"Passing Touchdowns O/U":                 {stat: model.StatPassTD, comparator: model.ComparatorOU},
+	"Passing Attempts O/U":                   {stat: model.StatPassAtt, comparator: model.ComparatorOU},
+	"Passing Completions O/U":                {stat: model.StatPassCmp, comparator: model.ComparatorOU},
+	"Passing + Rushing Yards O/U":            {stat: model.StatPassRushYds, comparator: model.ComparatorOU},
+	"Rushing Yards O/U":                      {stat: model.StatRushYds, comparator: model.ComparatorOU},
+	"Rushing Attempts O/U":                   {stat: model.StatRushAtt, comparator: model.ComparatorOU},
+	"Rushing + Receiving Yards O/U":          {stat: model.StatRushRecYds, comparator: model.ComparatorOU},
+	"Receiving Yards O/U":                    {stat: model.StatRecYds, comparator: model.ComparatorOU},
+	"Receptions O/U":                         {stat: model.StatRec, comparator: model.ComparatorOU},
+	"Interceptions Thrown O/U":               {stat: model.StatInt, comparator: model.ComparatorOU},
+	"Passing Touchdowns Milestones":          {stat: model.StatPassTD, comparator: model.ComparatorAtLeast},
+	"Passing Yards Milestones":               {stat: model.StatPassYds, comparator: model.ComparatorAtLeast},
+	"Passing Attempts Milestones":            {stat: model.StatPassAtt, comparator: model.ComparatorAtLeast},
+	"Passing Completions Milestones":         {stat: model.StatPassCmp, comparator: model.ComparatorAtLeast},
+	"Passing + Rushing Yards Milestones":     {stat: model.StatPassRushYds, comparator: model.ComparatorAtLeast},
+	"Rushing Yards Milestones":               {stat: model.StatRushYds, comparator: model.ComparatorAtLeast},
+	"Rushing and Receiving Yards Milestones": {stat: model.StatRushRecYds, comparator: model.ComparatorAtLeast},
+	"Rushing Attempts Milestones":            {stat: model.StatRushAtt, comparator: model.ComparatorAtLeast},
+	"Receiving Yards Milestones":             {stat: model.StatRecYds, comparator: model.ComparatorAtLeast},
+	"Receptions Milestones":                  {stat: model.StatRec, comparator: model.ComparatorAtLeast},
+	"Anytime Touchdown Scorer":               {stat: model.StatTD, comparator: model.ComparatorAtLeast, threshold: 1},
+	"Score 2 or More":                        {stat: model.StatTD, comparator: model.ComparatorAtLeast, threshold: 2},
+	"Score 3 or More":                        {stat: model.StatTD, comparator: model.ComparatorAtLeast, threshold: 3},
+}
+
+// classify uses the market type name plus a full-game period check. DK
 // marks alternates main:true too, so that flag is never used.
-func classifyMain(m dkMarket) (mainClass, bool) {
+func classify(m dkMarket) (mainClass, bool) {
 	if taxonomy.PeriodFromName(m.Name) != model.PeriodFull {
 		return mainClass{}, false
 	}
@@ -380,9 +493,34 @@ func classifyMain(m dkMarket) (mainClass, bool) {
 		return mainClass{family: model.FamilySpread}, true
 	case "Total":
 		return mainClass{family: model.FamilyTotal, stat: "points", comparator: model.ComparatorOU}, true
-	default:
-		return mainClass{}, false
 	}
+	if c, ok := propTypes[m.MarketType.Name]; ok {
+		c.family = model.FamilyPlayer
+		return c, true
+	}
+	return mainClass{}, false
+}
+
+// propFacets places one prop selection: the player, the outcome and the
+// line. Price-only deltas carry none of this; adds do.
+func propFacets(c mainClass, s dkSelection) (player, outcome string, line float64, ok bool) {
+	if len(s.Participants) == 0 || s.Participants[0].Type != "Player" || s.Participants[0].Name == "" {
+		return "", "", 0, false // TD lists also carry team defenses
+	}
+	player = s.Participants[0].Name
+	switch {
+	case c.comparator == model.ComparatorOU:
+		ot := strings.ToLower(strings.TrimSpace(s.OutcomeType))
+		if (ot != "over" && ot != "under") || s.Points == nil {
+			return "", "", 0, false
+		}
+		return player, ot, *s.Points, true
+	case c.threshold > 0:
+		return player, model.MilestoneOutcome(c.threshold), c.threshold, true
+	case s.MilestoneValue != nil:
+		return player, model.MilestoneOutcome(*s.MilestoneValue), *s.MilestoneValue, true
+	}
+	return "", "", 0, false
 }
 
 // outcomeFor maps a DK outcomeType to the identity outcome: team ID for
@@ -413,10 +551,6 @@ func makeQuote(e dkEvent, m dkMarket, s dkSelection, c mainClass) (model.Quote, 
 	if err != nil {
 		return model.Quote{}, false
 	}
-	outcome, ok := outcomeFor(c.family, s.OutcomeType, e.homeID, e.awayID)
-	if !ok {
-		return model.Quote{}, false
-	}
 	status := model.StatusOpen
 	if m.suspended() || selSuspended(s.Status) {
 		status = model.StatusSuspended
@@ -429,14 +563,27 @@ func makeQuote(e dkEvent, m dkMarket, s dkSelection, c mainClass) (model.Quote, 
 	if s.TrueOdds != nil {
 		dec = *s.TrueOdds
 	}
-	return model.Quote{
+	q := model.Quote{
 		Book: Name, BookGameID: e.ID.String(), BookMarketID: m.ID.String(),
 		BookSelectionKey: s.ID.String(), Sport: e.sport, League: e.sport,
 		Family: c.family, Period: model.PeriodFull, Subject: "event",
-		Stat: c.stat, Comparator: c.comparator, Outcome: outcome, Line: model.CopyLine(line),
+		Stat: c.stat, Comparator: c.comparator, Line: model.CopyLine(line),
 		MarketName: m.Name, SelectionName: s.Label,
 		Price: model.Price{American: price, Decimal: dec, Status: status, InPlay: isLive(e.Status)},
-	}, true
+	}
+	if c.family == model.FamilyPlayer {
+		player, outcome, ln, ok := propFacets(c, s)
+		if !ok {
+			return model.Quote{}, false
+		}
+		return model.PropQuote(q, player, c.stat, c.comparator, outcome, ln), true
+	}
+	outcome, ok := outcomeFor(c.family, s.OutcomeType, e.homeID, e.awayID)
+	if !ok {
+		return model.Quote{}, false
+	}
+	q.Outcome = outcome
+	return q, true
 }
 
 // parseAmerican accepts DK's Unicode minus and EVEN.
@@ -476,6 +623,7 @@ func (id ID) String() string { return string(id) }
 type dkParticipant struct {
 	Name      string `json:"name"`
 	VenueRole string `json:"venueRole"`
+	Type      string `json:"type"` // on prop selections: "Player"
 }
 type dkEvent struct {
 	ID             ID              `json:"id"`
@@ -520,6 +668,9 @@ type dkSelection struct {
 	DisplayOdds         *dkOdds  `json:"displayOdds"`
 	TrueOdds            *float64 `json:"trueOdds"`
 	Status              string   `json:"status"`
+	// Player props: the player, and a milestone rung's threshold.
+	Participants   []dkParticipant `json:"participants"`
+	MilestoneValue *float64        `json:"milestoneValue"`
 }
 type dkDoc struct {
 	Events               []dkEvent                 `json:"events"`

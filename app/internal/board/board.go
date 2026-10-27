@@ -382,7 +382,8 @@ func (c *core) publish(d Delta) {
 	}
 }
 
-// isMain: the board shows full-game main markets only.
+// isMain: the board shows full-game main markets and full-game player props
+// (two-way lines and milestone rungs).
 func isMain(identity string) (model.IdentityParts, bool) {
 	p, ok := model.ParseIdentity(identity)
 	if !ok || p.Class != "main" || p.Period != model.PeriodFull {
@@ -391,6 +392,8 @@ func isMain(identity string) (model.IdentityParts, bool) {
 	switch p.Family {
 	case model.FamilyMoneyline, model.FamilySpread, model.FamilyTotal:
 		return p, true
+	case model.FamilyPlayer:
+		return p, p.Comparator == model.ComparatorOU || p.Comparator == model.ComparatorAtLeast
 	}
 	return p, false
 }

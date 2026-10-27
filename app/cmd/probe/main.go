@@ -23,6 +23,7 @@ import (
 	"betstampodds/internal/book"
 	"betstampodds/internal/books"
 	"betstampodds/internal/model"
+	"betstampodds/internal/tlsinfo"
 )
 
 type streamResult struct {
@@ -150,6 +151,9 @@ func main() {
 	listen := flag.Duration("listen", 15*time.Second, "how long to keep each stream open")
 	flag.Parse()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stderr, nil)))
+	// The probe exists to give a straight answer about an environment's
+	// reachability, and the TLS ClientHello is part of that answer.
+	slog.Info("tls compatibility", "godebug", tlsinfo.CompatGODEBUG())
 
 	out := json.NewEncoder(os.Stdout)
 	out.SetIndent("", "  ")

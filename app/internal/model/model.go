@@ -269,7 +269,77 @@ func LineString(p *float64) string {
 // PlayerSubject is a provisional player identity until a player registry is
 // added. It is intentionally a single function so the registry can replace it.
 func PlayerSubject(name string) string {
-	return "player:" + Slug(name)
+	return "player:" + Slug(PlayerName(name))
+}
+
+// PlayerName normalizes a player name so the books agree: lower case, no
+// diacritics or punctuation, no generational suffix. "Amon-Ra St. Brown",
+// "John Metchie III" and "Kenneth Walker" match their spellings at every book
+// this way (checked across three books' NFL props on 2026-10-27).
+func PlayerName(name string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if base, ok := foldDiacritic[r]; ok {
+			r = base
+		}
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r == '-' || unicode.IsSpace(r):
+			b.WriteRune(' ')
+		}
+	}
+	words := strings.Fields(b.String())
+	out := words[:0]
+	for _, w := range words {
+		switch w {
+		case "jr", "sr", "ii", "iii", "iv", "v":
+			continue
+		}
+		out = append(out, w)
+	}
+	return strings.Join(out, " ")
+}
+
+var foldDiacritic = map[rune]rune{
+	'á': 'a', 'à': 'a', 'â': 'a', 'ä': 'a', 'ã': 'a', 'å': 'a', 'ç': 'c',
+	'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e', 'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
+	'ñ': 'n', 'ó': 'o', 'ò': 'o', 'ô': 'o', 'ö': 'o', 'õ': 'o', 'ú': 'u', 'ù': 'u',
+	'û': 'u', 'ü': 'u', 'ý': 'y', 'ÿ': 'y', 'š': 's', 'ž': 'z', 'č': 'c', 'ć': 'c',
+}
+
+// NFL player prop stats. Every book's own stat names map onto these.
+const (
+	StatPassYds     = "pass_yds"
+	StatPassTD      = "pass_td"
+	StatPassAtt     = "pass_att"
+	StatPassCmp     = "pass_cmp"
+	StatPassRushYds = "pass_rush_yds"
+	StatRushYds     = "rush_yds"
+	StatRushAtt     = "rush_att"
+	StatRushRecYds  = "rush_rec_yds"
+	StatRecYds      = "rec_yds"
+	StatRec         = "rec"
+	StatInt         = "int"
+	StatTD          = "td" // touchdowns scored: anytime (1+), 2+, 3+
+)
+
+// PropQuote fills the identity facets of a full-game player prop.
+//
+// Two-way props use ComparatorOU with outcome "over"/"under"; the line may
+// differ by book and the best-price rule treats it like a game total.
+// Milestones ("25+ receiving yards", "anytime TD") use ComparatorAtLeast with
+// the threshold as the outcome and the line, so every rung of a ladder is its
+// own slot and rungs never overwrite each other.
+func PropQuote(q Quote, player, stat, comparator, outcome string, line float64) Quote {
+	q.Family, q.Period, q.Subject, q.Stat, q.Comparator, q.Outcome = FamilyPlayer, PeriodFull, PlayerSubject(player), stat, comparator, outcome
+	q.Line = &line
+	return q
+}
+
+// MilestoneOutcome is the outcome of an at-least prop with threshold n.
+func MilestoneOutcome(n float64) string {
+	return strconv.FormatFloat(n, 'f', -1, 64)
 }
 
 // TeamSubject is the canonical team subject.

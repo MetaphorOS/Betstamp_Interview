@@ -14,13 +14,18 @@ import (
 // names, so this mapping is the only way to place them.
 type seed struct {
 	markets map[string]*mktSeed
-	ids     []string // sorted main market IDs; the subscription
+	ids     []string // sorted market IDs, game lines and props; the subscription
+	mainIDs []string // sorted game-line market IDs; the poll
 }
 
 type mktSeed struct {
 	family  string
 	gameRef string
-	runners map[string]*runnerSeed // selectionId -> runner; IDs repeat across markets
+	// fixedLine: the line is part of the identity (prop milestone rungs and
+	// TD scorers). Their runners carry handicap 0, which is not a line.
+	fixedLine bool
+	runners   map[string]*runnerSeed // selectionId -> runner; IDs repeat across markets
+	skip      map[string]bool        // runners deliberately not mapped (team defenses on a TD list)
 }
 
 type runnerSeed struct {
@@ -32,9 +37,9 @@ type runnerSeed struct {
 }
 
 func (s *seed) clone() *seed {
-	c := &seed{markets: make(map[string]*mktSeed, len(s.markets)), ids: append([]string(nil), s.ids...)}
+	c := &seed{markets: make(map[string]*mktSeed, len(s.markets)), ids: append([]string(nil), s.ids...), mainIDs: append([]string(nil), s.mainIDs...)}
 	for id, m := range s.markets {
-		cm := &mktSeed{family: m.family, gameRef: m.gameRef, runners: make(map[string]*runnerSeed, len(m.runners))}
+		cm := &mktSeed{family: m.family, gameRef: m.gameRef, fixedLine: m.fixedLine, runners: make(map[string]*runnerSeed, len(m.runners)), skip: m.skip}
 		for sid, r := range m.runners {
 			cr := *r
 			cr.line = model.CopyLine(r.line)
@@ -60,13 +65,19 @@ func (s *seed) mapMarket(m *fdMarket, src model.Source, recvAt time.Time, rememb
 	out := make([]model.Update, 0, len(runners))
 	for _, r := range runners {
 		rs := ms.runners[r.SelectionID.String()]
+		if rs == nil && (ms.skip[r.SelectionID.String()] || ms.family == model.FamilyPlayer) {
+			// Skipped on purpose, or a new prop rung: frames carry no runner
+			// names to place it, and the 2-minute resnapshot will add it.
+			// Resyncing would take the whole stream down for it.
+			continue
+		}
 		if rs == nil {
 			return nil, fmt.Errorf("%w: unknown runner %s on market %s", book.ErrResync, r.SelectionID, m.MarketID)
 		}
 		line := rs.line
 		if ms.family == model.FamilyMoneyline {
 			line = nil
-		} else if r.Handicap != nil {
+		} else if r.Handicap != nil && !ms.fixedLine {
 			line = model.CopyLine(r.Handicap)
 		}
 		american, decimal := rs.american, rs.decimal

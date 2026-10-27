@@ -524,3 +524,36 @@ func TestStaleBookDoesNotHoldGameOpen(t *testing.T) {
 		t.Fatal("game held by a stale book was never pruned")
 	}
 }
+
+// One two-way prop at three books with different lines: the lower over and
+// the higher under win, as for a game total. Ladder rungs are separate slots.
+func TestPlayerPropsBestAndLadders(t *testing.T) {
+	c := newTestCore(book.Descriptor{Name: "mgm", PriceKind: book.PriceAmerican})
+	prop := func(cmp, outcome string, line float64) string {
+		return model.IdentityKey(model.PropQuote(model.Quote{}, "Christian Watson", model.StatRec, cmp, outcome, line))
+	}
+	over, under := prop(model.ComparatorOU, "over", 4.5), prop(model.ComparatorOU, "under", 4.5)
+	c.apply(upd("dk", "dk-g", over, f(4.5), -116, t0), t0)
+	c.apply(upd("fd", "fd-g", over, f(4.5), -106, t0), t0)
+	c.apply(upd("mgm", "mgm-g", over, f(3.5), -160, t0), t0)
+	c.apply(upd("dk", "dk-g", under, f(4.5), -110, t0), t0)
+	c.apply(upd("fd", "fd-g", under, f(4.5), -125, t0), t0)
+	c.apply(upd("mgm", "mgm-g", under, f(3.5), 120, t0), t0)
+	if b := c.slots[slotKey(c, "dk", "dk-g", over)].best; b == nil || b.Book != "mgm" {
+		t.Fatalf("over best = %+v, want mgm (3.5 beats 4.5)", b)
+	}
+	if b := c.slots[slotKey(c, "dk", "dk-g", under)].best; b == nil || b.Book != "dk" {
+		t.Fatalf("under best = %+v, want dk (4.5 -110)", b)
+	}
+
+	r25, r50 := prop(model.ComparatorAtLeast, "25", 25), prop(model.ComparatorAtLeast, "50", 50)
+	c.apply(upd("dk", "dk-g", r25, f(25), -400, t0), t0)
+	c.apply(upd("fd", "fd-g", r25, f(25), -380, t0), t0)
+	c.apply(upd("dk", "dk-g", r50, f(50), 140, t0), t0)
+	if b := c.slots[slotKey(c, "dk", "dk-g", r25)].best; b == nil || b.Book != "fd" {
+		t.Fatalf("25+ best = %+v, want fd", b)
+	}
+	if s := c.slots[slotKey(c, "dk", "dk-g", r50)]; s == nil || s.entries["dk"].American != 140 {
+		t.Fatal("50+ rung missing or overwritten")
+	}
+}

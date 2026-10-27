@@ -30,6 +30,7 @@ import (
 	"betstampodds/internal/clocksync"
 	"betstampodds/internal/fanout"
 	"betstampodds/internal/supervisor"
+	"betstampodds/internal/tlsinfo"
 )
 
 func main() {
@@ -41,6 +42,11 @@ func main() {
 	flag.Parse()
 	log := slog.New(slog.NewJSONHandler(os.Stderr, nil))
 	slog.SetDefault(log)
+
+	// GODEBUG is fixed at init and chooses the key exchanges the TLS client
+	// offers; one book's edge treats those shapes differently, so record which
+	// compatibility settings are off instead of trusting the deploy config.
+	log.Info("tls compatibility", "godebug", tlsinfo.CompatGODEBUG())
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()

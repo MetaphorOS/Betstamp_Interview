@@ -67,6 +67,38 @@ func TestUpdateCarriesLineMove(t *testing.T) {
 	}
 }
 
+func TestPlayerSubjectMatchesAcrossBookSpellings(t *testing.T) {
+	same := [][]string{
+		{"John Metchie III", "John Metchie"},
+		{"Amon-Ra St. Brown", "Amon-Ra St Brown"},
+		{"Luther Burden III", "luther burden"},
+		{"Kenneth Walker Jr.", "Kenneth Walker"},
+		{"Day’Ron Sharpe", "DayRon Sharpe"},
+		{"José Ramírez", "Jose Ramirez"},
+	}
+	for _, p := range same {
+		if PlayerSubject(p[0]) != PlayerSubject(p[1]) {
+			t.Errorf("%q -> %s, %q -> %s", p[0], PlayerSubject(p[0]), p[1], PlayerSubject(p[1]))
+		}
+	}
+	if PlayerSubject("Amon-Ra St. Brown") != "player:amon-ra-st-brown" {
+		t.Fatalf("subject = %s", PlayerSubject("Amon-Ra St. Brown"))
+	}
+}
+
+func TestMilestoneRungsAreDistinctSlots(t *testing.T) {
+	a := PropQuote(Quote{}, "Christian Watson", StatRecYds, ComparatorAtLeast, MilestoneOutcome(25), 25)
+	b := PropQuote(Quote{}, "Christian Watson", StatRecYds, ComparatorAtLeast, MilestoneOutcome(50), 50)
+	if IdentityKey(a) == IdentityKey(b) {
+		t.Fatal("ladder rungs collided")
+	}
+	o := PropQuote(Quote{}, "Christian Watson", StatRec, ComparatorOU, "over", 4.5)
+	p := PropQuote(Quote{}, "Christian Watson", StatRec, ComparatorOU, "over", 3.5)
+	if IdentityKey(o) != IdentityKey(p) {
+		t.Fatal("O/U identity must ignore the line")
+	}
+}
+
 func TestBoardSlotKeyRefusesMissingGame(t *testing.T) {
 	q := baseQuote()
 	q.BookGameID = "book-game-must-not-be-used"

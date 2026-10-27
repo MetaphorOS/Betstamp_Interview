@@ -13,7 +13,7 @@ import (
 func TestNoBookNamesOutsideBookPackages(t *testing.T) {
 	root := filepath.Join("..", "..")
 	self, _ := filepath.Abs(".")
-	banned := []string{"draft" + "kings", "fan" + "duel"}
+	banned := []string{"draft" + "kings", "fan" + "duel", "bet" + "mgm"}
 	checked := 0
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {

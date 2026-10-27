@@ -223,18 +223,21 @@ func truncate(s string, n int) string {
 	return s[:n]
 }
 
-// Poll reads current prices for every seeded market from SMP, in batches of
-// 70, with a browser UA (SMP returns 500 to Go's default UA).
+// Poll reads current prices for the seeded game lines from SMP, in batches
+// of 70, with a browser UA (SMP returns 500 to Go's default UA).
 func (b *bookImpl) Poll(ctx context.Context, snap *book.Snapshot) ([]model.Update, error) {
 	sd, ok := snap.Private.(*seed)
 	if !ok || sd == nil {
 		return nil, errors.New("fanduel: seed missing")
 	}
+	// Game lines only: props are hundreds of markets per game, and they ride
+	// the stream and the 2-minute resnapshot instead.
+	ids := sd.mainIDs
 	var out []model.Update
-	for start := 0; start < len(sd.ids); start += smpBatch {
-		end := min(start+smpBatch, len(sd.ids))
+	for start := 0; start < len(ids); start += smpBatch {
+		end := min(start+smpBatch, len(ids))
 		asOf := time.Now()
-		markets, err := b.smp(ctx, sd.ids[start:end])
+		markets, err := b.smp(ctx, ids[start:end])
 		if err != nil {
 			return nil, err
 		}

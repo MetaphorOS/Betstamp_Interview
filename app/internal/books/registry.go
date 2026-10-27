@@ -4,6 +4,7 @@ package books
 
 import (
 	"betstampodds/internal/book"
+	"betstampodds/internal/books/betmgm"
 	"betstampodds/internal/books/draftkings"
 	"betstampodds/internal/books/fanduel"
 	"betstampodds/internal/books/polymarket"
@@ -21,6 +22,8 @@ func Default(opt Options) *book.Registry {
 	r.Register(dk)
 	fd, _ := fanduel.New(fanduel.Config{BundlePath: opt.FanDuelBundlePath})
 	r.Register(fd)
+	mgm, _ := betmgm.New(betmgm.Config{})
+	r.Register(mgm)
 	pm, _ := polymarket.New(polymarket.Config{})
 	r.Register(pm)
 	return r

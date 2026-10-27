@@ -18,7 +18,9 @@ import (
 //     - spread: higher signed line (+3.5 beats +3; -3 beats -3.5);
 //     - over: lower total;
 //     - under: higher total;
-//     - moneyline has no line.
+//     - moneyline has no line;
+//     - player prop over/under: like a total. A milestone rung ("25+") is
+//     its own slot, so its entries share one line.
 //     That is why -3 -110 beats -3.5 +100 for the favorite: a half point
 //     through 3 is worth more than 10 cents in the NFL.
 //  3. Same line: higher decimal odds.
@@ -44,6 +46,15 @@ func lineScore(family, outcome string, line *float64) float64 {
 			return -*line
 		}
 		return *line
+	case model.FamilyPlayer:
+		// Two-way props read like a total. A milestone's outcome is its
+		// threshold, so every entry in its slot has the same line.
+		switch outcome {
+		case "over":
+			return -*line
+		case "under":
+			return *line
+		}
 	}
 	return 0
 }

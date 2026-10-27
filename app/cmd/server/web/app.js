@@ -6,6 +6,9 @@ const state = {
   books: [],            // [{name, displayName, priceKind}]
   games: new Map(),     // id -> game
   slots: new Map(),     // gameId|identity -> {family, outcome, entries, best}
+  byGame: new Map(),    // gameId -> Set of slot keys
+  propsOpen: new Set(loadJSON("propsOpen", [])), // games whose player-prop panel is open
+  propView: new Map(),  // gameId -> chosen prop view ("rec_yds|ou")
   health: {},           // book -> health
   mode: "best",
   format: load("format", "american"), // american | decimal
@@ -27,11 +30,14 @@ function load(k, def) {
 function save(k, v) {
   try { localStorage.setItem("odds." + k, v); } catch {}
 }
+function loadJSON(k, def) {
+  try { return JSON.parse(localStorage.getItem("odds." + k)) || def; } catch { return def; }
+}
 const shown = new Map(); // cell key -> {text, line, am} last rendered, for flash
 const dirty = new Set();
 let fullRender = true;
 
-const SHORT = { draftkings: "DK", fanduel: "FD", polymarket: "PM" };
+const SHORT = { draftkings: "DK", fanduel: "FD", betmgm: "MGM", polymarket: "PM" };
 const short = (b) => SHORT[b] || b;
 const displayName = (b) => (state.books.find((x) => x.name === b) || {}).displayName || b;
 // Server time now. The ping-based estimate (error ±half the round trip) is
@@ -151,8 +157,9 @@ function onSnapshot(s) {
   state.books = s.books || [];
   state.games = new Map((s.games || []).map((g) => [g.id, g]));
   state.slots = new Map();
+  state.byGame = new Map();
   for (const sl of s.slots || []) {
-    state.slots.set(`${sl.g}|${sl.id}`, { family: sl.family, outcome: sl.outcome, entries: sl.entries || {}, best: sl.best || null });
+    addSlot(`${sl.g}|${sl.id}`, { family: sl.family, outcome: sl.outcome, entries: sl.entries || {}, best: sl.best || null });
   }
   state.health = s.health || {};
   state.clock = s.clock || { valid: false };
@@ -194,7 +201,7 @@ function onDelta(d) {
       // The server dropped every slot of a removed game; so do we, or a
       // revived game would show its old prices next to the new one.
       state.games.delete(d.g);
-      for (const key of [...state.slots.keys()]) if (gameOf(key) === d.g) dropSlot(key);
+      for (const key of [...(state.byGame.get(d.g) || [])]) dropSlot(key);
     } else state.games.set(d.g, d.game);
     renderModes();
     fullRender = true;
@@ -207,7 +214,7 @@ function onDelta(d) {
   if (!sl) {
     const parts = d.id.split("|");
     sl = { family: parts[0], outcome: parts[6], entries: {}, best: null };
-    state.slots.set(key, sl);
+    addSlot(key, sl);
   }
   if (d.b) {
     if (d.rm) delete sl.entries[d.b];
@@ -241,10 +248,18 @@ function onDelta(d) {
 // A slot key is gameId|identity; the game id has "|" in it and the identity
 // has exactly 7 fields.
 const gameOf = (key) => key.split("|").slice(0, -7).join("|");
+function addSlot(key, sl) {
+  state.slots.set(key, sl);
+  const g = gameOf(key);
+  if (!state.byGame.has(g)) state.byGame.set(g, new Set());
+  state.byGame.get(g).add(key);
+}
 function dropSlot(key) {
   state.slots.delete(key);
-  for (const k of [...shown.keys()]) if (k.startsWith(key + "|")) shown.delete(k);
+  state.byGame.get(gameOf(key))?.delete(key);
+  for (const m of ["best", ...state.books.map((b) => b.name)]) shown.delete(`${key}|${m}`);
 }
+const slotsOf = (gid) => [...(state.byGame.get(gid) || [])].map((k) => [k, state.slots.get(k)]).filter(([, sl]) => sl);
 function push(arr, v) {
   arr.push(v);
   if (arr.length > 300) arr.shift();
@@ -310,16 +325,10 @@ document.getElementById("modes").addEventListener("click", (e) => {
 // ---- board ----------------------------------------------------------------
 function isLive(g) {
   if (g.live) return true;
-  for (const [key, sl] of state.slots) {
-    if (key.startsWith(g.id + "|") && Object.values(sl.entries).some((e) => e.live)) return true;
-  }
-  return false;
+  return slotsOf(g.id).some(([, sl]) => Object.values(sl.entries).some((e) => e.live));
 }
 function hasPrices(g) {
-  for (const [key, sl] of state.slots) {
-    if (key.startsWith(g.id + "|") && Object.keys(sl.entries).length) return true;
-  }
-  return false;
+  return slotsOf(g.id).some(([, sl]) => Object.keys(sl.entries).length);
 }
 
 function renderBoard() {
@@ -381,12 +390,121 @@ function renderGame(gid) {
       <td>${cell(gid, "moneyline", t.id)}</td>
     </tr>`;
   const sport = state.league === "all" ? `<span class="sport">${esc((g.sport || "").toUpperCase())}</span>` : "";
+  const props = propSlots(gid);
+  const open = props.length > 0 && state.propsOpen.has(gid);
+  const scroll = el.querySelector(".ptable-wrap")?.scrollTop || 0; // live re-renders keep the reader's place
+  el.classList.toggle("wide", open);
+  const players = new Set(props.map((p) => p.player)).size;
+  const toggle = props.length
+    ? `<button type="button" class="props-toggle" data-props="${esc(gid)}" aria-expanded="${open}">
+        Player props <span class="muted">· ${players} players</span><span class="chev">${open ? "▾" : "▸"}</span></button>`
+    : "";
   el.innerHTML = `<div class="ghead"><span>${sport}${esc(g.away.name)} @ ${esc(g.home.name)}</span>${when}</div>
     <table>
       <thead><tr><th class="team-h"></th><th>Spread</th><th>Total</th><th>Moneyline</th></tr></thead>
       <tbody>${row(g.away, "away")}${row(g.home, "home")}</tbody>
-    </table>`;
+    </table>${toggle}${open ? renderProps(gid, props) : ""}`;
+  if (scroll) el.querySelector(".ptable-wrap").scrollTop = scroll;
 }
+
+// ---- player props -----------------------------------------------------------
+// Prop identities: player_prop|full|player:<slug>|<stat>|ou|main|over|under
+// (a two-way line; the line may differ by book) or ...|atleast|main|<N> (a
+// milestone rung, "N+"; anytime TD is td|atleast|1).
+const STAT_LABEL = {
+  pass_yds: "Pass Yds", pass_td: "Pass TDs", pass_att: "Pass Att", pass_cmp: "Completions", pass_rush_yds: "Pass + Rush Yds",
+  rush_yds: "Rush Yds", rush_att: "Rush Att", rush_rec_yds: "Rush + Rec Yds", rec_yds: "Rec Yds", rec: "Receptions",
+  int: "Interceptions", td: "TD Scorer",
+};
+const STAT_ORDER = Object.keys(STAT_LABEL);
+function propSlots(gid) {
+  const out = [];
+  for (const [key, sl] of slotsOf(gid)) {
+    if (sl.family !== "player_prop" || !Object.keys(sl.entries).length) continue;
+    const p = key.split("|").slice(-7); // family|period|subject|stat|comparator|class|outcome
+    out.push({ key, sl, player: p[2], stat: p[3], cmp: p[4], outcome: p[6] });
+  }
+  return out;
+}
+const playerName = (subject) => subject.replace(/^player:/, "").split("-").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+function propViews(props) {
+  const seen = new Set(props.map((p) => `${p.stat}|${p.cmp}`));
+  const views = [];
+  for (const st of STAT_ORDER) {
+    for (const cmp of ["ou", "atleast"]) {
+      if (!seen.has(`${st}|${cmp}`)) continue;
+      const label = st === "td" ? STAT_LABEL[st] : `${STAT_LABEL[st]} ${cmp === "ou" ? "O/U" : "Alt"}`;
+      views.push([`${st}|${cmp}`, label]);
+    }
+  }
+  return views;
+}
+// The prop table: one view (stat and line type) at a time, a row per player
+// and side or rung, a column per sportsbook, the best price highlighted.
+function renderProps(gid, props) {
+  const views = propViews(props);
+  let view = state.propView.get(gid);
+  if (!views.some(([v]) => v === view)) view = views[0][0];
+  const [stat, cmp] = view.split("|");
+  const rows = props.filter((p) => p.stat === stat && p.cmp === cmp);
+  const books = state.books.filter((b) => b.priceKind === "american" && props.some((p) => p.sl.entries[b.name]));
+  const byPlayer = new Map();
+  for (const r of rows) {
+    if (!byPlayer.has(r.player)) byPlayer.set(r.player, []);
+    byPlayer.get(r.player).push(r);
+  }
+  const order = cmp === "ou" ? (r) => (r.outcome === "over" ? 0 : 1) : (r) => Number(r.outcome);
+  const TD = { 1: "Anytime", 2: "2+", 3: "3+" };
+  let body = "";
+  for (const player of [...byPlayer.keys()].sort((a, b) => playerName(a).localeCompare(playerName(b)))) {
+    const rs = byPlayer.get(player).sort((a, b) => order(a) - order(b));
+    rs.forEach((r, i) => {
+      const label = cmp === "ou" ? (r.outcome === "over" ? "Over" : "Under") : stat === "td" ? TD[r.outcome] || `${r.outcome}+` : `${r.outcome}+`;
+      const name = i === 0 ? `<td class="pname" rowspan="${rs.length}">${esc(playerName(player))}</td>` : "";
+      body += `<tr class="${i === 0 ? "pfirst" : ""}">${name}<td class="plabel">${label}</td>${books.map((b) => propCell(r, b.name)).join("")}</tr>`;
+    });
+  }
+  const chips = views
+    .map(([v, label]) => `<button type="button" data-pview="${esc(v)}" data-game="${esc(gid)}" aria-pressed="${v === view}">${esc(label)}</button>`)
+    .join("");
+  return `<div class="props">
+      <nav class="chips" aria-label="Prop market">${chips}</nav>
+      <div class="ptable-wrap"><table class="ptable">
+        <thead><tr><th class="pname-h">Player</th><th></th>${books.map((b) => `<th>${esc(short(b.name))}</th>`).join("")}</tr></thead>
+        <tbody>${body}</tbody>
+      </table></div>
+    </div>`;
+}
+function propCell(r, b) {
+  const e = r.sl.entries[b];
+  if (!e) return `<td><span class="pc none">—</span></td>`;
+  let cls = "pc";
+  // Best is only worth marking where there is a choice.
+  if (r.sl.best && r.sl.best.book === b && Object.keys(r.sl.entries).length > 1) cls += " best";
+  if (e.st === "suspended") cls += " susp";
+  if (bookExcluded(b)) cls += " stale";
+  const ln = r.cmp === "ou" ? `<span class="ln">${e.line}</span>` : "";
+  const title = `${displayName(b)} · updated ${age(e.at)}${e.st === "suspended" ? " · suspended" : ""}`;
+  return `<td><span class="${cls}" title="${esc(title)}">${ln}${price(e.am, e.dec)}</span></td>`;
+}
+document.getElementById("board").addEventListener("click", (e) => {
+  const t = e.target.closest("button[data-props]");
+  if (t) {
+    const gid = t.dataset.props;
+    if (state.propsOpen.has(gid)) state.propsOpen.delete(gid);
+    else state.propsOpen.add(gid);
+    save("propsOpen", JSON.stringify([...state.propsOpen]));
+    renderGame(gid);
+    return;
+  }
+  const v = e.target.closest("button[data-pview]");
+  if (v) {
+    state.propView.set(v.dataset.game, v.dataset.pview);
+    const wrap = v.closest(".game")?.querySelector(".ptable-wrap");
+    if (wrap) wrap.scrollTop = 0; // a new view starts at the top
+    renderGame(v.dataset.game);
+  }
+});
 
 function bookExcluded(b) {
   const h = state.health[b];
@@ -507,6 +625,7 @@ function healthCard(b) {
     draftkings: "subscribe → subscribed",
     fanduel: "connection_init → ack",
     polymarket: "PING → PONG once subscribed",
+    betmgm: "Subscribe → completion",
   };
   const hs = h.handshakeMs
     ? `${ms(h.handshakeMs)} <span class="muted">${esc(HS[b.name] || "request → reply")} · ${age(h.handshakeAt)}</span>`
@@ -515,6 +634,7 @@ function healthCard(b) {
     draftkings: "socket ping→pong",
     fanduel: "socket ping→pong; FanDuel holds pongs ~1 s",
     polymarket: "PING→PONG message",
+    betmgm: "socket ping→pong",
   };
   const ping = h.pingMs
     ? `${ms(h.pingMs)} <span class="muted">p50 ${ms(h.pingP50Ms)} · ${esc(PING[b.name] || "ping")}</span>`

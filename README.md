@@ -21,6 +21,8 @@ and total, pregame and in-play, for the NFL (required) and the NBA (extra).
 | One ingestion per book; many viewers; a third book without re-architecting | Done; Polymarket added by touching only its own package plus a 3-line registration (the page has since gained a few per-book labels, [§7.3](#73-a-third-book-without-re-architecting)) |
 | Code review | Three reviews; what was fixed, and what was left open and why ([§14](#14-code-review-what-was-found-and-what-was-done)) |
 | Best price across different lines | Rule defined and tested ([§5.4](#54-best-price-when-books-are-on-different-lines)) |
+| Extra: BetMGM as a fourth sportsbook | NFL + NBA main lines, REST + SignalR push ([§4.5](#45-betmgm-ontario)) |
+| Extra: NFL player props | O/U lines, N+ ladders and TD scorers from DK, FD and BetMGM, with best price, in an expandable panel per game ([§4.6](#46-nfl-player-props)) |
 
 ---
 
@@ -57,9 +59,26 @@ go run ./cmd/server            # http://localhost:8080
 With Docker:
 
 ```bash
-docker build -t betstamp-odds app
-docker run --rm -p 8080:8080 betstamp-odds
+docker build -t betstamp-odds:local app
+docker run --rm -p 8080:8080 betstamp-odds:local
 ```
+
+The image sets `GODEBUG=tlssecpmlkem=0` in its own environment ([why](#13-known-limitations-stated-plainly)),
+so a bare `docker run` is the same TLS client the deployment is. To replace a
+container that is already running, use
+[`app/scripts/recreate-local.ps1`](app/scripts/recreate-local.ps1): it builds,
+stops and renames the old container for rollback, starts the new one, and
+checks that the setting reached the process and that `/healthz` answers. A
+`docker restart` is not equivalent — it keeps the old image *and* the old
+environment, so it picks up neither.
+
+```powershell
+powershell -File app\scripts\recreate-local.ps1            # build, swap the container, read /healthz
+powershell -File app\scripts\recreate-local.ps1 -NoBuild   # same, reusing the existing image tag
+```
+
+If the machine's execution policy refuses local scripts, add
+`-ExecutionPolicy Bypass` after `powershell`.
 
 The books are Ontario sites: run it from Ontario (it was built and measured
 from a home Ontario IP and from Fly's Toronto region).
@@ -456,6 +475,93 @@ Two improvements weren't needed for this submission:
 | **DraftKings** | **changes only**: partial adds/changes/removes, line moves as new IDs | full event/market/selection state, tombstones, slot ownership |
 | **FanDuel** | **full market state** in every frame (all runners) | only the ID → team/side mapping from discovery, and last line per runner |
 | **Polymarket** | order-book snapshot per token on subscribe, then price changes per token | token → slot mapping |
+| **BetMGM** | **whole market** per update (every option, REST shape), plus id-only deletes | every market per fixture, grouped so alternates collapse onto the main line |
+
+### 4.5 BetMGM (Ontario)
+
+| Purpose | Endpoint |
+|---|---|
+| Fixtures + game lines | `GET https://www.betmgm.ca/cds-api/bettingoffer/fixtures?sportIds=11&competitionIds=35` (NBA `7` / `6004`), paged by `skip`/`take` |
+| Every market of one game (props) | `GET .../cds-api/bettingoffer/fixture-view?fixtureIds=6:48482&firstMarketGroupOnly=false` |
+| Push | `wss://cds-push.betmgm.ca/ws-1-0` (ASP.NET SignalR JSON hub), topic `<fixture.context>\|all` |
+
+- **Access:** REST answers curl's or Go's User-Agent with an HTML block page; a
+  current Chrome UA alone gets JSON (the same fix as DraftKings). The socket
+  upgrades with no headers. A public frontend access id goes in the query
+  (`BETMGM_ACCESS_ID` overrides). Per-game reads are paced at one a second;
+  back-to-back they draw an occasional 403 that passes on retry.
+- **From a Linux container, the TLS ClientHello decides it.** Go 1.26+ adds the
+  P-curve ML-KEM key exchanges to a default ClientHello, and BetMGM's edge
+  answers that hello with its branded block page and an HTTP 403 on REST, while
+  accepting the WebSocket upgrade from the same process. `GODEBUG=tlssecpmlkem=0`
+  drops just those two groups (the X25519/ML-KEM hybrid stays) and the REST
+  seed succeeds. The image and `fly.toml` set it;
+  [§13](#13-known-limitations-stated-plainly) has the experiment and its
+  caveat. From Fly's datacenter address it is not enough: the refusal survives
+  the compatible hello, so that one is about the IP.
+- **Two sources, one shape.** NFL fixtures are "V2" (`6:48482`), NBA "V1"
+  (`20030815`). Both arrive as `optionMarkets` over REST and as
+  `OptionMarketUpdate` on the `|all` topic, so one parser covers both. V1 names
+  teams by `participantId` and reads "Away at Home"; V2 has typed participants.
+- **Main line.** Every alternate spread and total is its own market named
+  "Spread"/"Totals", all with `isMain:false`. The main one is the market with
+  the smallest `spread` field, BetMGM's own price imbalance (0.03 on a
+  -110/-108 line). All of them are kept per game, and the choice is redone on
+  every update, so a main-line move is a line move on the same board slot. On
+  Panthers @ Packers this gave -3.5 / 48 against DraftKings' -3.5 / 48.5.
+- **Live switch.** `MainToLiveUpdate` is broadcast for every sport; only one
+  naming our fixture as `preMatchId` triggers a resnapshot.
+- **Poll:** the two league listings (game lines only), every 30 s. Props
+  refresh through the stream and the 5-minute resnapshot.
+- **Publish time:** each push message has a `timestamp` truncated to the
+  second and a `latencyMs` measured from that truncated value. Their sum is
+  the push server's send time to the millisecond: in captures, receipt minus
+  that sum held at 28–75 ms (the network hop) while `latencyMs` ranged
+  0–950 ms. It is used as the book timestamp, like DraftKings'
+  `websocketPublishTimestamp`. Time spent upstream of BetMGM's push server
+  is not measurable, because the event time is known only to the second.
+  Measured from home on 2026-10-27 ~21:05Z (Windows build, NTP-corrected,
+  ±14 ms): book→server p50 **≈ 6 ms** (p95 ≈ 33 ms, n=14), against DraftKings
+  ≈ 23 ms and Polymarket ≈ 46 ms in the same window. That is just the network
+  hop from BetMGM's push server (Cloudflare, Toronto) to us: its WebSocket
+  ping round trip was 16–19 ms.
+- **Ping:** SignalR's own keep-alive (`{"type":6}`) has no reply, so the
+  round trip is timed with a WebSocket ping control frame, as for DraftKings
+  and FanDuel; both are sent.
+- **Measuring on Windows:** this PC's clock drifted from 52 to 154 ms ahead
+  of NTP within an hour on 2026-10-27, so the server's raw `/api/board`
+  latency (receipt − book timestamp, uncorrected) read ~150 ms high for every
+  book. The page subtracts the measured offset; the raw stats do not.
+
+### 4.6 NFL player props
+
+Full-game NFL player props from DraftKings, FanDuel and BetMGM:
+
+| Kind | Example | Slot identity | Best price |
+|---|---|---|---|
+| Over/under | Christian Watson receptions 4.5 | `player_prop\|full\|player:christian-watson\|rec\|ou\|main\|over` | like a total: lower over, higher under, then price |
+| Milestone rung | Christian Watson 50+ receiving yards | `...\|rec_yds\|atleast\|main\|50` | same line by construction, so price |
+| TD scorer | anytime / 2+ / 3+ | `...\|td\|atleast\|main\|1` | price |
+
+Every rung of a ladder is its own slot, so rungs never overwrite each other.
+Players are matched by a normalized name (lower case, no punctuation or
+diacritics, no Jr/Sr/II–V), which matched every player across the three books
+in the 2026-10-27 research. Team defenses on TD lists are skipped.
+Stats: pass yards/TDs/attempts/completions, pass+rush yards, rush
+yards/attempts, rush+rec yards, rec yards, receptions, interceptions, TDs.
+
+| Book | Where the props come from | Push |
+|---|---|---|
+| DraftKings | one GET per prop subcategory (22 for NFL), each with its own subscription partial | yes, same socket |
+| FanDuel | one MGA facet-search POST per pregame game for structure; SMP for prices | yes, prop market ids join the AppSync subscription |
+| BetMGM | `fixture-view` per pregame game | yes, the game's `\|all` topic |
+
+Polls stay on game lines only (props are hundreds of markets a game); props
+are refreshed by each book's stream plus the full resnapshot (DK and BetMGM
+5 min, FD 2 min). Props are posted only close to the game, so most Sunday games
+show few until Friday or so. The page shows them under each NFL game:
+"Player props", one market at a time (e.g. "Rec Yds O/U", "Rec Yds Alt",
+"TD Scorer"), a column per book, the best price highlighted.
 
 ---
 
@@ -549,6 +655,7 @@ Each side picks its own best, so a game's over and under can show different tota
 |---|---|---|
 | DraftKings | REST snapshot returned **403 (Akamai)** to Go's default User-Agent, to a Chrome 142 UA, and to requests with no headers. A controlled ablation isolated the User-Agent: a current Chrome 156 UA alone returns 200, no cookies needed. | Send the current browser UA (`DK_USER_AGENT` overrides it). |
 | FanDuel | SMP price endpoint returned **HTTP 500 with an empty body** to Go's default UA. | Browser UA plus `Accept: */*`. |
+| BetMGM | REST from a Linux container returned **403** with the branded HTML block page and a `__cf_bm` cookie, from the same IP where the Windows build passed; the socket upgrade from that container was accepted, so the seed was what failed. | Drop the P-curve ML-KEM key exchanges from the ClientHello (`GODEBUG=tlssecpmlkem=0`, in the image and `fly.toml`; [§13](#13-known-limitations-stated-plainly)). |
 | Both | Automated browser capture (Playwright) hit access-denied / bot-check pages, while plain HTTP and WebSocket clients with the right headers worked. | Use the site's own APIs directly, never a headless browser. |
 | Both, on Fly | The first Fly machines got outgoing IPs in **185.156.47.x**: DK snapshot 403, FanDuel homepage 403 (so no JS bundle, so no push). A probe from another Fly host (205.234.149.74) had passed minutes earlier. | An **app-scoped static outgoing IP** in Toronto (209.71.100.151), which all three books accept. The server logs its outgoing IP at startup so a block can be tied to an address. |
 | Region lock | Both books are Ontario-only. | Everything runs from Ontario: the dev PC, and Fly's Toronto region. Not tested from outside Ontario. |
@@ -775,6 +882,7 @@ One page, plain JavaScript, embedded in the binary.
 | Fanout | snapshot then deltas with no gap, resume, too-old resume gets a snapshot, slow client dropped, ping, clock validity |
 | FanDuel | app key extracted from the real bundle, simulated key rotation recovers, esports refused, NBA competition filter |
 | Extensibility | the names `draftkings` and `fanduel` appear nowhere outside `internal/books` and `cmd` |
+| Deployment guard | the image and `fly.toml` still set `GODEBUG=tlssecpmlkem=0`; losing it is silent until a book 403s |
 
 Live checks are in `boardctl` (headless run with recovery tests) and `probe`
 (reachability from any machine).
@@ -786,6 +894,13 @@ Live checks are in `boardctl` (headless run with recovery tests) and `probe`
 - Fly.io, region `yyz` (Toronto), one always-on `shared-cpu-1x` / 512 MB machine
   ([`app/fly.toml`](app/fly.toml)); health check on `/healthz`.
 - Image: two-stage Docker build to a ~11 MB distroless image.
+- **TLS compatibility:** the image sets `GODEBUG=tlssecpmlkem=0`, and
+  `fly.toml`'s `[env]` declares it again, so the deployed ClientHello is the
+  one measured to pass ([§13](#13-known-limitations-stated-plainly)).
+  Certificate verification and TLS 1.3 are unchanged. `app/internal/archtest`
+  fails if either place loses it. The server logs the setting it actually
+  started with (`"msg":"tls compatibility"`), so the deployed handshake is
+  auditable from `fly logs` rather than inferred from config.
 - **Outgoing IP:** app-scoped static egress IP `209.71.100.151` (see [§6.1](#61-what-we-hit)).
 - Before deploying, `cmd/probe` was run on Fly to check each book's snapshot and
   stream from Fly's network (`app/fly.probe.toml`).
@@ -927,6 +1042,66 @@ touching the books.
   games and Polymarket's in-play flag going stale on stream updates (both found
   in live data), and the supervisor's watchdog stuck behind slow REST calls
   (found in code review; [§8.1](#a-bug-worth-telling-the-watchdog-stuck-behind-rest)).
+- **BetMGM is refused from Fly's egress even with the setting: the handshake
+  was one difference, not the whole rule.** Deployed on 2026-10-27 ~21:31Z with
+  the setting confirmed in the running process (the startup log line reads
+  `"msg":"tls compatibility","godebug":"tlssecpmlkem=0"`), BetMGM answered
+  **403** to every listing attempt — 21:31, 21:33, 21:35Z, retried on its 2-min
+  cycle — while DraftKings, FanDuel and Polymarket stayed live from the same
+  machine and the same egress IP (209.71.100.151). The same image and the same
+  setting work from the home IP ([§4.5](#45-betmgm-ontario)), at the same
+  minute, so time is not the variable. A probe deployment in `yyz` from a
+  **different** Fly address (185.156.47.129, the shared range that also gets
+  DraftKings refused and FanDuel's homepage 403'd — which is why the static IP
+  exists) was refused by BetMGM too. Two Fly addresses, two separate binaries,
+  one residential address: **the refusal follows the network, not the client.**
+  Cloudflare's score weighs address reputation alongside the fingerprint, and
+  once the address is bad enough the handshake cannot lift it — which is exactly
+  why the setting worked at home and not here. Getting the feed on Fly needs the
+  provider route (partner API, or an address they allow-list), not another
+  client tweak; until then the book reports **down** there and the other three
+  carry the board. Note the refusal is scoped to the `cds-api` REST path: the
+  push endpoint still accepts its upgrade, so there is no socket to fall back on
+  before the seed succeeds.
+- **BetMGM's main line** is inferred from its price-imbalance field, not a flag
+  the book sets; it can differ from the line BetMGM's own page features.
+- **Player matching is by name.** It matched every player in the research
+  sample, but two players with the same normalized name in one game would merge.
+- **New prop runners mid-stream:** a FanDuel ladder rung that appears between
+  snapshots is ignored until the next 2-minute resnapshot (FanDuel frames carry
+  no runner names to place it).
+- **The BetMGM refusal from Linux was the TLS ClientHello, not Linux.**
+  The refusal is Cloudflare Bot Management, not a rate limit or geo block: a
+  plain 403 with BetMGM's branded block page and a `__cf_bm` cookie, no
+  challenge and no 429/1015. On 2026-10-27 between 21:01 and 21:07Z, from one
+  IP (home), the same app code made 17 of 17 BetMGM reads from Windows and 0 of
+  3 from a Linux container. A smaller Go program built against an older module
+  passed 5 of 6 from Linux, and its build metadata showed `tlssecpmlkem=0`
+  where the app binary carried the default. Go 1.26+ adds SecP256r1MLKEM768 and
+  SecP384r1MLKEM1024 to a default ClientHello — two more key shares, about
+  1.2 KB and 1.6 KB — and `GODEBUG=tlssecpmlkem=0` removes exactly those two
+  groups, keeping the X25519/MLKEM768 hybrid, certificate verification and
+  TLS 1.3.
+  With it set, the unchanged adapter, run in the app's own container network,
+  seeded 18 games / 626 quotes and reported its stream ready (heartbeats, no
+  price updates in a 10 s listen); the unchanged control immediately after it
+  answered 403 again. The container now runs on that setting. Note what this
+  means for the symptom: the socket was never the broken half, it was simply
+  never opened, because the REST seed fails first and there is nothing to
+  subscribe to.
+  **This is a tested workaround, not a proved root cause.** An unchanged
+  control also passed once, so a time-dependent refusal cannot be excluded, and
+  the bot score itself is not observable. It applies to the whole process, not
+  to one book. Two narrower options were rejected: hand-picked
+  `CurvePreferences` would restate a compatibility default that Go owns and
+  then drift from it, and making the client imitate a browser more closely is
+  evasion. The supported route to a guaranteed feed is BetMGM's partner Sports
+  API, which needs their approval.
+  If the setting is lost, the listing fails and the snapshot is retried every
+  2 min; a refused per-game read reuses that game's last good read for up to
+  20 min, otherwise shows game lines without props. A connected socket keeps
+  streaming prices through refusals. `app/internal/archtest` fails the build if
+  the image or `fly.toml` loses the setting.
 - **Code-review findings** that are fixed, and those deliberately left open, are
   covered in [§14](#14-code-review-what-was-found-and-what-was-done). The
   open item closest to biting is Polymarket's 100-event discovery cap (NBA
@@ -1058,7 +1233,7 @@ app/
   cmd/boardctl/         headless runner: prints deltas, latency summary, kill tests
   cmd/probe/            reachability probe used to vet Fly IPs
   internal/book/        the book contract (Snapshot / Stream / Poll), registry
-  internal/books/       draftkings/, fanduel/, polymarket/ adapters; registry.go
+  internal/books/       draftkings/, fanduel/, polymarket/, betmgm/ adapters; registry.go
   internal/supervisor/  reconnect, backoff, watchdog, poll fallback, health
   internal/board/       canonical games, slots, best price, game status, latency
   internal/fanout/      SSE hub, wire format, clock record
@@ -1066,9 +1241,11 @@ app/
   internal/teams/       NFL + NBA team registry
   internal/match/       cross-book game matching
   internal/clocksync/   SNTP offset
+  internal/tlsinfo/     which TLS key-exchange compatibility settings are in effect
   internal/taxonomy/    book-neutral market-text helpers
   internal/archtest/    the "no book names outside books" guard
   testdata/             trimmed real captures used by the replay tests
+  scripts/              recreate-local.ps1: build, swap the local container, check health
   Dockerfile, fly.toml, fly.probe.toml
 research/               the Oct 24–25 investigation: Node probes, Go research
                         clients and 3-hour soak harness, normalizer prototype,
